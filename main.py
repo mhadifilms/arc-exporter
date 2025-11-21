@@ -86,12 +86,33 @@ def safe_dir_name(name: str) -> str:
 
 # ---------- Utilities ----------
 def arc_profiles():
+    """
+    Get list of Arc profiles, excluding the system profile.
+    Filters by both directory name and display name.
+    """
     if not ARC_USER_DATA.is_dir():
         sys.exit(f"Arc not found at: {ARC_USER_DATA}")
+
+    # First, get the display names to filter by both name and display name
+    ls = read_json(ARC_LOCAL_STATE)
+    ic = (ls.get("profile") or {}).get("info_cache") or {}
+
+    # Identify system profiles by either directory name or display name
+    system_profiles = set()
+    for k, meta in ic.items():
+        if k == "__ARC_SYSTEM_PROFILE":
+            system_profiles.add(k)
+        if isinstance(meta, dict) and meta.get("name") == "__ARC_SYSTEM_PROFILE":
+            system_profiles.add(k)
+
+    # Now find the profiles that aren't system profiles
     profs = []
     for d in sorted(ARC_USER_DATA.iterdir()):
-        if d.is_dir() and (d / "Preferences").exists():
+        if (d.is_dir() and
+            (d / "Preferences").exists() and
+            d.name not in system_profiles):
             profs.append(d)
+
     if not profs:
         sys.exit("No Arc profiles found.")
     return profs
