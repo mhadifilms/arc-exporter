@@ -1,10 +1,47 @@
+# macOS / Windows cruft
 .DS_Store
 .Trashes
 .Spotlight-V100
 Thumbs.db
 $RECYCLE.BIN/
+
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project outputs (never check in user data)
 arc-export/
 arc-export/**
 *.bak-*
-*.bak-*
+
+# Local config
+.env
+config.local.toml

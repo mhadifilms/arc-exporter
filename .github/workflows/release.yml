@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build artefacts but don't publish."
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build_pypi:
+    name: Build PyPI wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build deps
+        run: python -m pip install --upgrade pip build twine
+      - name: Build
+        run: python -m build
+      - name: Twine check
+        run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-pypi
+          path: dist/*
+
+  build_binaries:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            label: macOS arm64
+            artifact: arc-exporter-macos-arm64
+          - os: macos-13
+            label: macOS x86_64
+            artifact: arc-exporter-macos-x86_64
+          - os: windows-latest
+            label: Windows
+            artifact: arc-exporter-windows-x86_64.exe
+          - os: ubuntu-latest
+            label: Linux
+            artifact: arc-exporter-linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install pyinstaller
+      - name: Build single-file binary
+        shell: bash
+        run: |
+          pyinstaller --onefile --name arc-exporter -p . arc_exporter/__main__.py
+      - name: Smoke test (non-Windows)
+        if: runner.os != 'Windows'
+        run: ./dist/arc-exporter --version
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: dist\arc-exporter.exe --version
+      - name: Rename for matrix label
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp dist/arc-exporter.exe out/${{ matrix.artifact }}
+          else
+            cp dist/arc-exporter out/${{ matrix.artifact }}
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+
+  build_linux_packages:
+    name: Build .deb / .rpm / .AppImage
+    needs: build_binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: arc-exporter-linux-x86_64
+          path: bin
+      - name: Install nfpm
+        run: |
+          curl -fsSL https://github.com/goreleaser/nfpm/releases/download/v2.38.0/nfpm_2.38.0_amd64.deb -o /tmp/nfpm.deb
+          sudo dpkg -i /tmp/nfpm.deb
+      - name: Make binary executable
+        run: chmod +x bin/arc-exporter-linux-x86_64
+      - name: Write nfpm config
+        run: |
+          cat > nfpm.yaml <<'YAML'
+          name: arc-exporter
+          arch: amd64
+          platform: linux
+          version: ${VERSION}
+          maintainer: Arc Exporter contributors
+          description: Safely migrate Arc Browser profiles to other browsers.
+          vendor: arc-exporter
+          homepage: https://github.com/mhadifilms/arc-exporter
+          license: MIT
+          contents:
+            - src: bin/arc-exporter-linux-x86_64
+              dst: /usr/bin/arc-exporter
+              file_info:
+                mode: 0755
+          YAML
+        env:
+          VERSION: ${{ github.ref_name }}
+      - name: Build .deb and .rpm
+        run: |
+          export VERSION=${GITHUB_REF_NAME#v}
+          envsubst < nfpm.yaml > nfpm.resolved.yaml || cp nfpm.yaml nfpm.resolved.yaml
+          nfpm pkg --packager deb --config nfpm.resolved.yaml --target arc-exporter.deb
+          nfpm pkg --packager rpm --config nfpm.resolved.yaml --target arc-exporter.rpm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            arc-exporter.deb
+            arc-exporter.rpm
+
+  publish:
+    name: Publish to PyPI and GitHub Release
+    needs: [build_pypi, build_binaries, build_linux_packages]
+    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+      - name: Move PyPI dist
+        run: |
+          mkdir -p dist
+          cp artefacts/dist-pypi/* dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artefacts/**/*
+          generate_release_notes: true

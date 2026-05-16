@@ -1,68 +1,128 @@
-## Arc Exporter (macOS)
+# arc-exporter
 
-Export Arc Browser profiles into cross‑browser importable artifacts, with optional direct import into Chrome/Chromium. Also includes optional helpers for Firefox/Zen.
+> Safely migrate Arc Browser profiles into Chrome, Brave, Edge, Vivaldi, Opera, Dia,
+> Firefox, Zen, LibreWolf, Floorp, Waterfox, Safari, and Orion — without losing
+> bookmarks, passwords, cards, cookies, extensions, history, or open tabs.
 
-### Features
-- Exports per‑profile, cross‑browser artifacts under `arc-export/`:
-  - bookmarks HTML (NETSCAPE format; importable by most browsers)
-  - passwords CSV (widely importable)
-  - cards CSV (reference only)
-- Copies Arc profiles into new Chrome/Chromium profiles (non‑destructive), including:
-  - passwords/cards merged into the Chrome profile (re‑encrypted with Chrome key)
-  - extensions install is EXPERIMENTAL and disabled by default (see below)
+[![CI](https://github.com/mhadifilms/arc-exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/mhadifilms/arc-exporter/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-### Requirements
-- macOS
-- Python 3.9+
-- Arc and Google Chrome installed
-- OpenSSL CLI available (for Chromium v10 decryption)
+## What it does
 
-### Quick start
-1) Fully quit Chrome and Arc (Cmd+Q).
-2) Run:
+Reads your Arc data on your machine, decrypts what it needs to in memory only, and
+produces both portable artefacts (NETSCAPE bookmarks HTML, password CSV, Firefox
+`cookies.sqlite`, extensions report, history JSON, …) and direct migrations into the
+browser of your choice. Nothing is sent over the network.
+
+For Chromium-family targets (Chrome, Brave, Edge, Vivaldi, Opera, Dia) the migration
+copies the entire Arc profile tree into a new target profile, re-encrypts saved
+passwords / credit cards / cookies against the destination browser's Safe Storage
+key, and synthesizes a native `Bookmarks` JSON from Arc's `StorableSidebar.json` so
+your pinned tabs appear in the bookmark bar.
+
+For Firefox-family targets and Safari/Orion, the tool drops import-ready files into
+`Profile N/imports/` inside the target's user-data directory so you can load them
+through the target's built-in importer.
+
+## Install
+
 ```bash
-python3 main.py
-```
-This writes portable exports to `arc-export/` and, by default, also creates new Chrome profiles (e.g., `Profile 1`, `Profile 2`, …). Use the flags below to tailor behavior.
+# Recommended: isolated pipx install
+pipx install arc-exporter
 
-### Common flags
-```bash
-# Only copy profiles + extensions into Chrome (skip exports)
-python3 main.py --no-passwords --no-cards --no-bookmarks
-
-# Only export artifacts (no Chrome profiles)
-python3 main.py --no-copy-profiles
-
-# Experimental: build AMO mapping + policies.json per profile (Firefox/Zen)
-python3 main.py --experimental-amo-mapping
-
-# Experimental: export cookies.sqlite per profile (Firefox/Zen)
-python3 main.py --import-cookies
-
-# Experimental: attempt per‑profile Chrome extension install (UNSTABLE)
-python3 main.py --experimental-extensions
+# From source
+git clone https://github.com/mhadifilms/arc-exporter
+cd arc-exporter
+pip install -e .
 ```
 
-### Outputs
-- Cross‑browser exports: `arc-export/profiles/<ArcProfileName>/`
-  - `bookmarks_<ts>.html` (NETSCAPE)
-  - `passwords_<ts>.csv`
-  - `cards_<ts>.csv`
-  - optional `extensions_report_<ts>.json` and `policies_<ts>.json` (Firefox/Zen)
-  - optional `cookies_<ts>.sqlite` (Firefox/Zen)
-- Chrome/Chromium (optional): `~/Library/Application Support/Google/Chrome/Profile N`
+A Homebrew formula and standalone binaries are planned; see the Releases page once
+they ship.
 
-### Scope and formats
-- By default, exports are generic/portable and not Firefox‑specific.
-- Firefox/Zen‑specific artifacts are only created when you use the optional flags:
-  - `--import-cookies` → produces Firefox‑format `cookies.sqlite`
-  - `--experimental-amo-mapping` → suggests Firefox/Zen `policies.json`
-  - No direct extension install to Firefox/Zen is performed.
+## Quick start
 
-### Experimental features (status: currently broken)
-- `--experimental-extensions`: Per‑profile extension preinstall for Chrome. Due to Chrome integrity checks and policy scope, automated installs may not complete or may require manual confirmation in each profile.
-- `--experimental-amo-mapping`: Tries to map Chrome extensions to AMO and write suggested policies.
-- `--import-cookies`: Exports Arc cookies into a Firefox‑format database.
+```bash
+# 1. Quit Arc and the target browser, OR pass --auto-quit to have us do it.
+# 2. Sanity-check your environment.
+arc-exporter doctor
 
-### Contribution
-Contributions are welcome! Please feel free to submit a pull request. This project is licensed under the MIT License.
+# 3. List your Arc profiles so you can confirm what will be migrated.
+arc-exporter list
+
+# 4. Migrate every Arc profile into the target browser of your choice.
+arc-exporter migrate --to=chrome
+# also: brave, edge, vivaldi, opera, dia, firefox, zen, librewolf, floorp,
+# waterfox, safari, orion
+
+# 5. Or, if you just want portable export files (no target browser changes):
+arc-exporter export all
+```
+
+The default output directory is OS-appropriate (`~/Library/Application
+Support/arc-exporter/exports/runs/<timestamp>/` on macOS). Override with `--output`.
+
+Every command supports:
+
+- `--dry-run` — plan only, no writes
+- `-v` / `-vv` — info / debug logging
+- `--force` — bypass the running-browser guard at your own risk
+- `--auto-quit` — try to gracefully quit running browsers before proceeding
+- `--keep-cache-dirs` — also copy `Cache` / `Code Cache` / `GPUCache` (skipped by default)
+- `--strip-storage` — drop `IndexedDB` / `Local Storage` / `Session Storage` /
+  `File System` (signs you out of most web apps; not recommended)
+
+## Undoing a migration
+
+Every target profile created by arc-exporter is marked with a small
+`.arc-exporter.json` file. The `rollback` command uses that marker to find and
+remove them without ever touching profiles you created yourself.
+
+```bash
+arc-exporter rollback ls --to=chrome
+arc-exporter rollback rm --to=chrome --profile "Profile 3"
+arc-exporter rollback rm --to=chrome --all -y
+```
+
+## What gets migrated
+
+| Kind        | Portable artefact                       | Chromium direct migration                     | Firefox direct migration              |
+|-------------|-----------------------------------------|-----------------------------------------------|---------------------------------------|
+| Bookmarks   | NETSCAPE `bookmarks.html`               | Synthesizes a native `Bookmarks` JSON         | `bookmarks.html` placed in `imports/` |
+| Passwords   | `passwords.csv` (chmod 600)             | Re-encrypted into target `Login Data`         | CSV placed in `imports/`              |
+| Cards       | Reference CSV (last 4 digits only)      | Re-encrypted into target `Web Data`           | —                                     |
+| Cookies     | Firefox `cookies.sqlite` + JSON         | Re-encrypted in-place in target `Cookies`     | `cookies.sqlite` placed in `imports/` |
+| Extensions  | HTML report with Chrome Web Store links | Per-profile report placed in `imports/`       | `policies.json` for force-install     |
+| History     | JSON + HTML                             | Copied as-is (plaintext)                      | —                                     |
+| Open tabs   | OneTab / Toby-compatible JSON           | —                                             | —                                     |
+| Easels/Notes| Markdown (best-effort scrape)           | —                                             | —                                     |
+
+## Security defaults
+
+- Passwords, cards, and cookies are decrypted **in memory only** — the legacy
+  approach of shelling out to `openssl` (which briefly leaked plaintext to `/tmp`)
+  is gone.
+- Every file containing credentials gets `chmod 0600` from the moment of creation.
+- Bookmark titles, URLs, extension names, and any other user-controlled string is
+  HTML-escaped before being emitted, so a malicious page title cannot inject script
+  into the exported HTML.
+- The tool refuses to mutate target-browser data while that browser is running.
+  Pass `--auto-quit` to terminate them gracefully or `--force` to override.
+- Every modification to a target browser's databases is backed up first under
+  `~/Library/Application Support/Google/Chrome/.arc-exporter-backups/` (or
+  equivalent), restorable via `arc-exporter backup restore <id>`.
+- macOS Keychain access is cached per process so you grant permission at most once
+  per Safe Storage entry per run.
+- The Chrome→AMO extension mapping fetch is capped at 50 pages so a misbehaving
+  endpoint cannot loop indefinitely.
+
+See [SECURITY.md](SECURITY.md) for the full threat model and how to report a
+vulnerability.
+
+## Contributing
+
+Issues and PRs welcome. Please don't open public issues for security
+vulnerabilities; use the private channel in [SECURITY.md](SECURITY.md).
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

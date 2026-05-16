@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      runtime:
+        patterns:
+          - "cryptography"
+          - "psutil"
+          - "typer"
+          - "rich"
+          - "pydantic"
+          - "httpx"
+          - "platformdirs"
+          - "keyring"
+      dev:
+        patterns:
+          - "pytest*"
+          - "ruff"
+          - "mypy"
+          - "build"
+          - "twine"
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
