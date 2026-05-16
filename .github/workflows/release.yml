@@ -29,7 +29,7 @@ jobs:
         run: python -m build
       - name: Twine check
         run: twine check dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-pypi
           path: dist/*
@@ -82,7 +82,7 @@ jobs:
           else
             cp dist/arc-exporter out/${{ matrix.artifact }}
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: out/${{ matrix.artifact }}
@@ -129,7 +129,7 @@ jobs:
           envsubst < nfpm.yaml > nfpm.resolved.yaml || cp nfpm.yaml nfpm.resolved.yaml
           nfpm pkg --packager deb --config nfpm.resolved.yaml --target arc-exporter.deb
           nfpm pkg --packager rpm --config nfpm.resolved.yaml --target arc-exporter.rpm
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-packages
           path: |
