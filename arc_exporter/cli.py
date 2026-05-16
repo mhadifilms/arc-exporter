@@ -448,6 +448,8 @@ def migrate(
                 f"ok={report.succeeded} skipped={list(report.skipped.keys())} "
                 f"errors={list(report.errors.keys())}"
             )
+            for kind, note in report.notes.items():
+                console().print(f"  [yellow]note[/] [bold]{kind}:[/] {note}")
 
         if not dry_run:
             _render_next_steps(target.name, is_chromium, migrated_display_names)

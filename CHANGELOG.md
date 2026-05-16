@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full Chromium-family migration: profile tree copy, native `Bookmarks` JSON
   synthesised from `StorableSidebar.json`, in-place cookie re-encryption against the
   destination's Safe Storage key, password and credit-card re-encryption.
+- Direct extension migration via `Secure Preferences` HMAC resigning: the Arc
+  extension folders ride along with the profile-tree copy, then
+  `arc_exporter.targets.secure_prefs` walks `protection.macs` and rewrites every
+  HMAC (plus `super_mac`) against the target browser's vendor seed and the
+  current machine's device ID. The target browser trusts the resigned file on
+  first launch and the user's extensions appear as already-installed — no Web
+  Store round-trip, no install dialogs. Algorithm cross-validated against Arc's
+  own MACs (29/29 + super_mac match) and Chrome's own MACs (7/7 + super_mac
+  match) so we know it's byte-perfect with Chromium's `pref_hash_calculator.cc`.
 - `--auto-quit` flag that gracefully terminates running browsers (osascript on
   macOS, taskkill on Windows, SIGTERM on Linux) before the running-browser guard.
 - `rollback` subcommand to safely remove profiles created by arc-exporter, keyed on

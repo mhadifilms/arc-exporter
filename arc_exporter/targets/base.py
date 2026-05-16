@@ -60,12 +60,17 @@ class MigrationReport:
     succeeded: dict[ArtefactKind, int] = field(default_factory=dict)
     skipped: dict[ArtefactKind, str] = field(default_factory=dict)
     errors: dict[ArtefactKind, str] = field(default_factory=dict)
+    # Per-artefact follow-up tips (e.g. "open imports/extensions.html and click each
+    # Add to Chrome button"). Surfaced in the CLI summary so the user knows what they
+    # still need to do by hand.
+    notes: dict[ArtefactKind, str] = field(default_factory=dict)
 
     def merge(self, other: MigrationReport) -> None:
         for k, v in other.succeeded.items():
             self.succeeded[k] = self.succeeded.get(k, 0) + v
         self.skipped.update(other.skipped)
         self.errors.update(other.errors)
+        self.notes.update(other.notes)
 
 
 class Target(ABC):

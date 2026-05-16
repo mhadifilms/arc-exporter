@@ -77,6 +77,58 @@ def test_list_extensions_merges_and_dedupes(tmp_path: Path):
     assert merged["id2"] == "OnlyFS"
 
 
+def test_preferences_reads_secure_preferences(tmp_path: Path):
+    """Arc keeps the real extensions list in Secure Preferences, not Preferences."""
+    p = tmp_path / "Profile"
+    p.mkdir()
+    (p / "Preferences").write_text(json.dumps({"extensions": {"settings": {}}}), encoding="utf-8")
+    (p / "Secure Preferences").write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        "aeblfdkhhhdcdjpifhhbdiojplfjncoa": {
+                            "state": 1,
+                            "manifest": {"name": "Acrobat", "version": "10.0"},
+                        },
+                        "ahfgeienlihckogmohjhadlkjgocpleb": {
+                            "state": 1,
+                            "manifest": {"name": "Docs Offline", "version": "1.0"},
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    names = {e.name for e in from_preferences(p)}
+    assert names == {"Acrobat", "Docs Offline"}
+
+
+def test_preferences_skips_orphan_component_extensions(tmp_path: Path):
+    """Component extensions with neither manifest.name nor a real 32-char ID are skipped."""
+    p = tmp_path / "Profile"
+    p.mkdir()
+    (p / "Preferences").write_text(
+        json.dumps(
+            {
+                "extensions": {
+                    "settings": {
+                        "ghost": {"state": 1},
+                        "aeblfdkhhhdcdjpifhhbdiojplfjncoa": {
+                            "state": 1,
+                            "manifest": {"name": "Real", "version": "1"},
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    names = {e.name for e in from_preferences(p)}
+    assert names == {"Real"}
+
+
 def test_extensions_html_escapes_names(tmp_path: Path):
     out = tmp_path / "x.html"
     exts = [

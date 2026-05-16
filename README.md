@@ -91,7 +91,7 @@ arc-exporter rollback rm --to=chrome --all -y
 | Passwords   | `passwords.csv` (chmod 600)             | Re-encrypted into target `Login Data`         | CSV placed in `imports/`              |
 | Cards       | Reference CSV (last 4 digits only)      | Re-encrypted into target `Web Data`           | —                                     |
 | Cookies     | Firefox `cookies.sqlite` + JSON         | Re-encrypted in-place in target `Cookies`     | `cookies.sqlite` placed in `imports/` |
-| Extensions  | HTML report with Chrome Web Store links | Per-profile report placed in `imports/`       | `policies.json` for force-install     |
+| Extensions  | HTML report with Chrome Web Store links | Extensions copied + `Secure Preferences` HMACs resigned for the target browser, so every extension is already installed on first launch | `policies.json` for force-install     |
 | History     | JSON + HTML                             | Copied as-is (plaintext)                      | —                                     |
 | Open tabs   | OneTab / Toby-compatible JSON           | —                                             | —                                     |
 | Easels/Notes| Markdown (best-effort scrape)           | —                                             | —                                     |
@@ -117,6 +117,45 @@ arc-exporter rollback rm --to=chrome --all -y
 
 See [SECURITY.md](SECURITY.md) for the full threat model and how to report a
 vulnerability.
+
+## How extension migration works
+
+Chromium protects every tracked preference (`extensions.settings.<id>`, the
+search engine, the homepage, …) with an HMAC-SHA256 signature and a global
+`super_mac` over the whole signature dict. The HMAC is keyed by:
+
+- the browser's compiled-in **seed** — the 64-byte `IDR_PREF_HASH_SEED_BIN` blob
+  for Google Chrome, the empty string for every other Chromium fork (Brave,
+  Edge, Opera, Vivaldi, Comet, Dia, Sidekick, Arc Search), and
+- the machine's **device ID** — `IOPlatformUUID` on macOS, the user's SID minus
+  its relative component on Windows, the empty string on Linux.
+
+The two browsers share the device ID (same machine), so the only thing standing
+between Arc's extension settings and Chrome trusting them is the seed
+difference. `arc-exporter migrate` exploits this directly:
+
+1. Copy the Arc profile tree into a brand-new `Profile N` directory — including
+   `Extensions/<id>/`, `Extension State`, `Local Extension Settings`, and
+   `Secure Preferences`.
+2. Read the freshly-copied `Secure Preferences`, walk every entry under
+   `protection.macs`, and recompute each HMAC against the **target browser's
+   seed** with the canonical-JSON serialiser Chromium itself uses (HTML-safe
+   escaping, empty-children stripped, `<` → `\u003C`).
+3. Recompute `super_mac` over the freshly-signed MAC dict.
+4. Write the resigned `Secure Preferences` back, and resign the unprotected
+   `Preferences` file too (it carries tracked prefs like `profile.name`).
+
+On first launch the target browser validates each HMAC against its own seed +
+machine ID, accepts the entries as authentic, finds the matching extension
+folders on disk, and loads them. No Web Store round-trip, no confirmation
+dialogs, no garbage-collection of "orphan" extension folders.
+
+The algorithm and per-vendor seeds are documented in `arc_exporter/targets/
+secure_prefs.py` with citations to Chromium's `pref_hash_calculator.cc` and the
+*HMAC and "Secure Preferences": Revisiting Chromium-based Browsers Security*
+paper (Picazo-Sanchez et al., CANS 2020). The HTML extension report next to
+each migrated profile is kept as a manual-reinstall fallback in case the seed
+ever rotates.
 
 ## Contributing
 

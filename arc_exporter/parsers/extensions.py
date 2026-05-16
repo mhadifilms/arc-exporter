@@ -1,8 +1,11 @@
 """List installed extensions from a Chromium profile.
 
-Combines two sources of truth:
+Combines three sources of truth:
 
 - ``Preferences``: machine-readable list of extension IDs + state + manifest summary.
+- ``Secure Preferences``: where Chromium *actually* stores most extension settings
+  (HMAC-protected). Arc keeps its entire extensions table here; ``Preferences`` is
+  usually empty. Skipping this source caused us to under-count by ~99%.
 - ``Extensions/<id>/<version>/manifest.json``: real on-disk manifest, used to resolve
   localised ``__MSG_…__`` names that ``Preferences`` doesn't expand.
 """
@@ -23,21 +26,42 @@ class Extension:
     enabled: bool = True
 
 
-def from_preferences(profile_dir: Path) -> list[Extension]:
-    prefs_path = profile_dir / "Preferences"
+def _extract_settings(prefs_path: Path) -> dict:
     if not prefs_path.exists():
-        return []
+        return {}
     try:
         prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
-    items = (prefs.get("extensions") or {}).get("settings") or {}
+        return {}
+    return (prefs.get("extensions") or {}).get("settings") or {}
+
+
+def from_preferences(profile_dir: Path) -> list[Extension]:
+    """Read ``Preferences`` *and* ``Secure Preferences``.
+
+    Arc registers nearly all extensions in ``Secure Preferences`` (the HMAC-protected
+    file), so reading only ``Preferences`` produced a near-empty list. We merge both
+    and dedupe by extension ID; entries in ``Secure Preferences`` win on conflicts
+    because they carry the live state.
+    """
+    items: dict[str, dict] = {}
+    items.update(_extract_settings(profile_dir / "Preferences"))
+    items.update(_extract_settings(profile_dir / "Secure Preferences"))
     out: list[Extension] = []
     for ext_id, meta in items.items():
-        if not isinstance(meta, dict):
+        if not isinstance(meta, dict) or not isinstance(ext_id, str):
             continue
         manifest = meta.get("manifest") or {}
         if "theme" in manifest:
+            continue
+        # Drop unrecoverable entries (component extensions, sync ghosts) that lack a
+        # human name and aren't even on disk. Anything with a manifest.name or a
+        # canonical 32-char extension ID is worth keeping so the user gets a real
+        # picture of what was installed.
+        looks_like_real = bool(manifest.get("name")) or (
+            len(ext_id) == 32 and ext_id.isalpha() and ext_id.islower()
+        )
+        if not looks_like_real:
             continue
         state = meta.get("state")
         enabled = state in (1, True)

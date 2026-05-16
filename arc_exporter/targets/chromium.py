@@ -59,6 +59,13 @@ _STORAGE_DIRS = {
     "File System",
 }
 
+# Note: Extension state (``Extensions/``, ``Secure Preferences``, ``Extension
+# State``, …) used to be in this skip list because Chromium garbage-collects
+# orphan extension folders when their ``Secure Preferences`` HMACs don't match
+# the target browser's seed. We now resign those HMACs via
+# ``arc_exporter.targets.secure_prefs`` after the copy, so Chrome trusts the
+# Arc-installed extensions and they appear in the new profile straight away.
+
 
 @dataclass
 class ChromiumTarget(Target):
@@ -347,10 +354,12 @@ class ChromiumTarget(Target):
         )
         self._register_profile(target_profile)
         report.profile = target_profile.display_name
-        # Cookies/history/extensions ride along with the profile tree copy. Bookmarks
-        # do *not*: Arc keeps them in the global StorableSidebar.json, so the per-
-        # profile "Bookmarks" file we just copied is empty. Replace it with a Chrome-
-        # native JSON we synthesize from the sidebar tree.
+        # Cookies/history ride along with the profile tree copy. Bookmarks do *not*:
+        # Arc keeps them in the global StorableSidebar.json, so the per-profile
+        # "Bookmarks" file we just copied is empty. Replace it with a Chrome-native
+        # JSON we synthesize from the sidebar tree. Extensions are handled below
+        # via External Extensions descriptors — copying them was wiped out by
+        # Chrome's Secure Preferences HMAC check.
         try:
             from arc_exporter.export.bookmarks_chrome_json import write_chrome_bookmarks
             from arc_exporter.parsers.sidebar import load_sidebar
@@ -366,7 +375,19 @@ class ChromiumTarget(Target):
             report.errors["bookmarks"] = str(e)
         # History is plaintext (URLs, titles, visit counts) so the copy is sufficient.
         report.succeeded["history"] = 1
-        report.succeeded["extensions"] = 1
+        # Extensions: Arc kept its entire ``extensions.settings`` table inside
+        # ``Secure Preferences``. The on-disk ``Extensions/<id>/`` folders rode
+        # along with the profile-tree copy. The remaining step is the integrity
+        # protection: Chromium hashes every tracked pref with HMAC-SHA256 keyed
+        # by the browser's vendor seed and the machine's device ID, then refuses
+        # to honour any entry whose MAC doesn't match. Since Arc and Chrome share
+        # the same device ID but use different seeds, we resign the whole tree
+        # against the target's seed so Chrome trusts the result.
+        try:
+            self.migrate_extensions(src, target_profile, request, report)
+        except Exception as e:
+            report.errors["extensions"] = str(e)
+            log.exception("[%s] extension migration failed: %s", self.name, e)
 
         # Cookies need re-encryption: encrypted_value is v10-prefixed AES-CBC against
         # Arc's Safe Storage key. Without this pass the target browser sees opaque
@@ -435,6 +456,97 @@ class ChromiumTarget(Target):
             report.skipped["passwords"] = "no target Safe Storage key"
             report.skipped["cards"] = "no target Safe Storage key"
         return report
+
+    def migrate_extensions(
+        self,
+        source_profile,
+        target_profile: TargetProfile,
+        request: MigrationRequest,
+        report: MigrationReport,
+    ) -> None:
+        """Resign Arc's extension registrations so the target browser honours them.
+
+        Chromium maintains an HMAC-SHA256 signature for every "tracked" preference
+        (``extensions.settings.<id>``, the homepage URL, the default search
+        engine, etc.) plus a ``super_mac`` HMAC over the whole MAC dict. The HMAC
+        is keyed by:
+
+        * the browser's compiled-in *seed* — the 64-byte ``IDR_PREF_HASH_SEED_BIN``
+          blob for Google Chrome, the empty string for every other Chromium fork;
+        * the machine's *device ID* — IOPlatformUUID on macOS, the SID without
+          its relative component on Windows, the empty string on Linux.
+
+        Arc and the target browser share the same device ID (same machine), so
+        the only thing standing between Arc's extension settings and Chrome
+        trusting them is the seed difference. We rewrite every MAC under
+        ``protection.macs`` against the target's seed, then rewrite
+        ``super_mac``.
+
+        The matching ``Extensions/<id>/`` directories, ``Extension State`` and
+        ``Local Extension Settings`` LevelDBs all rode along with the profile-tree
+        copy, so once the prefs validate Chrome finds everything in place. The
+        end result is a profile where every Arc extension is already installed
+        and enabled the moment Chrome opens the picker entry — no Web Store
+        round-trip, no install confirmation dialogs.
+
+        Records ``succeeded["extensions"] = <count>`` if the resign worked, or
+        falls back to ``skipped["extensions"]`` + the HTML report when the
+        target's preferences file is missing or unreadable.
+        """
+        from arc_exporter.targets.secure_prefs import (
+            extension_ids_in_prefs,
+            resign_in_place,
+        )
+
+        secure_prefs_path = target_profile.path / "Secure Preferences"
+        prefs_path = target_profile.path / "Preferences"
+
+        if not secure_prefs_path.exists():
+            report.skipped["extensions"] = (
+                "no Secure Preferences in copied profile; see HTML report for the install list"
+            )
+            return
+
+        try:
+            data = json.loads(secure_prefs_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            report.skipped["extensions"] = f"could not read Secure Preferences: {e}"
+            return
+
+        installed = len(extension_ids_in_prefs(data))
+        resign_in_place(self.name, data)
+        secure_prefs_path.write_text(
+            json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        log.info(
+            "[%s] resigned Secure Preferences for %d extension(s)",
+            self.name,
+            installed,
+        )
+
+        # ``Preferences`` also carries tracked-pref HMACs (profile.name, search
+        # engine, etc.). We just wrote ``profile.name`` ourselves in
+        # ``_register_profile`` without resigning, which would normally cause
+        # Chromium to ignore it. Resign now so the user-visible profile name
+        # actually sticks.
+        if prefs_path.exists():
+            try:
+                prefs_data = json.loads(prefs_path.read_text(encoding="utf-8"))
+                resign_in_place(self.name, prefs_data)
+                prefs_path.write_text(
+                    json.dumps(prefs_data, separators=(",", ":"), ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except (OSError, json.JSONDecodeError) as e:
+                log.warning("[%s] could not resign Preferences: %s", self.name, e)
+
+        report.succeeded["extensions"] = installed
+        if installed:
+            report.notes["extensions"] = (
+                f"resigned {installed} extension(s); Chrome loads them directly from the copied "
+                "Extensions/ folder — no Web Store round-trip needed"
+            )
 
     def _reencrypt_cookies(
         self,
