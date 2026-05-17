@@ -322,7 +322,11 @@ def _render_next_steps(
             f"1. Launch [bold]{pretty}[/].\n"
             f"2. Click your avatar to open the profile picker. Your migrated profiles\n"
             f"{picker_line}\n"
-            f"3. Sign in to {pretty} Sync to fan bookmarks and passwords out to your\n"
+            f"3. [yellow]Enable each migrated extension[/] when {pretty} prompts (one click\n"
+            f"   each, or visit [cyan]chrome://extensions[/] and toggle them on). {pretty}'s\n"
+            f"   side-load protection installs every Web-Store extension disabled\n"
+            f"   until you confirm — there's no API to bypass this from outside the browser.\n"
+            f"4. Sign in to {pretty} Sync to fan bookmarks and passwords out to your\n"
             f"   other devices.\n\n"
             f"[dim]Undo:[/]  arc-exporter rollback ls --to={target_name}\n"
             f"[dim]Undo:[/]  arc-exporter rollback rm --to={target_name} --all"
@@ -346,7 +350,7 @@ def migrate(
     output: Path | None = typer.Option(None, "--output"),
     cookies: bool = typer.Option(False, "--cookies"),
     history: bool = typer.Option(False, "--history"),
-    tabs: bool = typer.Option(False, "--tabs"),
+    tabs: bool = typer.Option(True, "--tabs/--no-tabs", help="Export today's open tabs as JSON (OneTab/Toby format)"),
     easels: bool = typer.Option(False, "--easels"),
     force: bool = typer.Option(False, "--force"),
     only: str | None = typer.Option(None, "--only", help="Comma-separated artefact kinds"),
@@ -423,6 +427,24 @@ def migrate(
                     arc_key = derive_v10_key(arc_secret)
                 except Exception:
                     arc_key = None
+
+        if is_chromium and not dry_run and result.profiles:
+            console().print(
+                f"[dim]Heads-up: {target.name.title()} will launch twice per profile. "
+                "First a short, near-silent launch installs your extensions from the "
+                "Web Store and quits. Then a second launch opens your Arc pinned + "
+                "today-tabs as ordinary tabs and stays running for you.\n\n"
+                "Two things you'll have to do by hand on first run, sorry — they're "
+                "Chrome 142+ side-load protections we can't disable from outside "
+                f"{target.name.title()}:\n"
+                "  1. [bold]Enable extensions.[/] Each extension shows up disabled "
+                "with a one-click 'Enable' confirmation popup (Chrome's own "
+                "'an extension was added' balloon). Walk through it once per "
+                "extension, or click Enable on each row in chrome://extensions.\n"
+                "  2. [bold]Pin tabs / tab groups.[/] Modern Chrome blocks the API "
+                "third-party tools used to set pinned-tab and tab-group state. "
+                "Right-click a tab → 'Pin tab' if you want them pinned again.[/]"
+            )
 
         migrated_display_names: list[str] = []
         for pe in result.profiles:

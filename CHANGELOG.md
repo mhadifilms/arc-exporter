@@ -14,15 +14,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full Chromium-family migration: profile tree copy, native `Bookmarks` JSON
   synthesised from `StorableSidebar.json`, in-place cookie re-encryption against the
   destination's Safe Storage key, password and credit-card re-encryption.
-- Direct extension migration via `Secure Preferences` HMAC resigning: the Arc
-  extension folders ride along with the profile-tree copy, then
-  `arc_exporter.targets.secure_prefs` walks `protection.macs` and rewrites every
-  HMAC (plus `super_mac`) against the target browser's vendor seed and the
-  current machine's device ID. The target browser trusts the resigned file on
-  first launch and the user's extensions appear as already-installed — no Web
-  Store round-trip, no install dialogs. Algorithm cross-validated against Arc's
-  own MACs (29/29 + super_mac match) and Chrome's own MACs (7/7 + super_mac
-  match) so we know it's byte-perfect with Chromium's `pref_hash_calculator.cc`.
+- Arc-faithful bookmark / tab split for Chromium targets. Arc keeps three
+  distinct URL buckets per space and we now map each to the right Chrome
+  surface:
+  - **Favorites** (Arc's icon strip) -> Chrome bookmark bar, flat. Only
+    these end up as Chrome *bookmarks* — previous releases dumped pinned
+    tabs in there too and the bookmark bar got unusable fast.
+  - **Pinned tabs** -> open Chrome tabs, leftmost in the tab strip.
+  - **Today tabs** -> open Chrome tabs, after the pinned ones.
+  `session.restore_on_startup` is forced to 1 ("Continue where you left
+  off") in the migrated `Preferences` between the two launches below, so
+  on every subsequent Chrome launch the tabs come back instead of being
+  silently discarded.
+  > Note: Chrome 142+ removed every external API (`--load-extension`,
+  > CDP `Extensions.loadUnpacked`, local-CRX install on macOS) that
+  > third-party tools used to call `chrome.tabs.update({pinned:true})` /
+  > `chrome.tabGroups`. Pin / group state can no longer be set
+  > programmatically without publishing a Web Store extension; pinned
+  > URLs come back as the leftmost ordinary tabs and the user
+  > right-clicks → "Pin tab" if they want them pinned.
+- Two-phase Chrome bootstrap (`arc_exporter.targets.external_extensions`).
+  Per profile we launch Chrome twice, with all between-phase work
+  happening while Chrome is OFF (so our `Secure Preferences` edits aren't
+  clobbered by Chrome rewriting the file on shutdown):
+  1. **Phase 1 — extension install.** Brief Chrome launch with
+     `External Extensions/<id>.json` descriptors pointing at
+     `clients2.google.com/service/update2/crx`. Arc's on-disk
+     `Extensions/<id>/<ver>/` binaries are never copied — Arc patches
+     several extensions, so they fail Chromium's
+     `verified_contents.json` content verification and end up
+     `DISABLE_CORRUPTED`. Google-signed CRX bundles from the Web Store
+     pass cleanly. A `rich` progress bar polls `Extensions/` for each
+     install; Chrome is SIGTERMed once everything is in place.
+  2. **Between phases.** Three edits are made while Chrome is OFF, in a
+     single resign pass so the HMACs end up consistent:
+     - `state=1` is set + `disable_reasons` cleared on freshly-installed
+       extensions. On Chrome 142+ this is reset back to
+       `DISABLE_EXTERNAL_EXTENSION` on next launch (Chrome's
+       unavoidable side-load consent gate), so users still see a
+       one-click "Enable" prompt per extension — the CLI Next Steps
+       panel calls this out. Older Chromium forks honour the clear.
+     - `location` is flipped from `6` (EXTERNAL_PREF_DOWNLOAD) to `1`
+       (INTERNAL). Chrome 142+ demotes it back to `6` when it sees the
+       matching descriptor on launch; we still do it for older forks.
+     - `session.restore_on_startup = 1` is written into `Preferences`.
+     Both `Secure Preferences` and `Preferences` are resigned against
+     the target's HMAC seed via `arc_exporter.targets.secure_prefs`.
+     The resign now covers the Chrome 137+ `*_encrypted_hash` entries
+     (OSCrypt-encrypted SHA256 alongside the legacy HMAC) in addition
+     to the legacy MACs and `super_mac` — without those, any value we
+     touch gets silently wiped on the next Chrome launch even though
+     the HMAC is correct. The algorithm is a mechanical port of
+     `PrefHashCalculator::CalculateEncryptedHash` +
+     `OSCryptImpl::EncryptString`, verified bit-for-bit against
+     Chrome's own stored output (test
+     `test_calculate_encrypted_matches_chromium_algorithm`).
+     External Extensions descriptors are kept on disk permanently
+     after phase 1. Deleting them used to trigger Chrome's
+     external-extensions garbage collector to wipe every entry on the
+     next launch ("0 extensions installed"); they're tiny
+     (~75 bytes/extension) and idempotent, and removing them silently
+     produces the regression every time.
+  3. **Phase 2 — tabs.** Chrome is relaunched with `--profile-directory`
+     plus the pinned + today URLs as positional arguments. Chrome opens
+     them as ordinary tabs in load order. The DevTools HTTP endpoints
+     are then used to close any leftover starter tab (NTP /
+     `about:blank`). Chrome is left running for the user. On macOS the
+     relaunch goes through `/usr/bin/open -na "Google Chrome" --args …`
+     (LaunchServices) instead of `subprocess.Popen` on the inner
+     binary; this is what fixes the "terminal crashed" report — the
+     direct-binary launch coupled the Chrome process tree to the
+     parent terminal's tty in a way that, combined with Python's
+     `Popen` ResourceWarning chatter on exit, was wedging the shell.
+     Other platforms still use `subprocess.Popen` with
+     `start_new_session=True` for the same effect.
+  Before phase 1 we also strip Arc's stale `extensions.settings` /
+  `protection.macs.extensions.settings` entries out of the copied
+  `Preferences` / `Secure Preferences` and resign against the target
+  browser's vendor seed (Python port of Chromium's
+  `pref_hash_calculator.cc`, cross-validated against Arc's own MACs
+  29/29 + super_mac and Chrome's own MACs 7/7 + super_mac).
+- Web-Store-only extension filter: only entries with `from_webstore=true`
+  AND a `clients2.google.com` update URL are passed to the External
+  Extensions installer. Drops Chrome built-ins Arc keeps in its prefs
+  ("Web Store", "Chromium PDF Viewer", "Google Hangouts", "Arc Internal
+  Extension") that previously showed up as bogus "didn't auto-install"
+  warnings every run.
 - `--auto-quit` flag that gracefully terminates running browsers (osascript on
   macOS, taskkill on Windows, SIGTERM on Linux) before the running-browser guard.
 - `rollback` subcommand to safely remove profiles created by arc-exporter, keyed on

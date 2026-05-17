@@ -32,7 +32,9 @@ same machine; Chromium itself does this on every save. The only thing that's
 
 from __future__ import annotations
 
+import base64
 import functools
+import hashlib
 import json
 import logging
 import plistlib
@@ -42,7 +44,27 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
 log = logging.getLogger("arc_exporter.targets.secure_prefs")
+
+# Chrome 137+ added a second protection layer on top of the legacy HMAC: every
+# tracked-pref entry gets a sibling ``<name>_encrypted_hash`` that holds an
+# OSCrypt-encrypted SHA256 of (seed + path + canonical value). When the value
+# changes Chrome validates BOTH the HMAC and the encrypted hash; mismatch on
+# either side causes Chrome to silently wipe the entry. Implemented in
+# ``services/preferences/tracked/pref_hash_calculator.cc`` (CalculateEncryptedHash)
+# and ``components/os_crypt/sync/os_crypt_mac.mm`` (EncryptString). The macOS
+# OSCrypt format is:
+#
+#   v10 (3 bytes prefix) || AES-128-CBC( SHA256(message), key, IV=" "*16, PKCS7 )
+#
+# The key is the same 16-byte PBKDF2 output we derive for cookies / Login Data
+# re-encryption (``derive_v10_key`` in ``arc_exporter.crypto``).
+_OSCRYPT_IV = b" " * 16
+_OSCRYPT_PREFIX = b"v10"
+_ENCRYPTED_HASH_SUFFIX = "_encrypted_hash"
 
 # ---------------------------------------------------------------------------
 # Seeds. Sourced from ``chrome/browser/prefs/chrome_pref_service_factory.cc``
@@ -260,47 +282,140 @@ def calculate(seed: bytes, device_id: str, path: str, value: Any) -> str:
     return _hmac.new(seed, msg, "sha256").hexdigest().upper()
 
 
+def calculate_encrypted(seed: bytes, aes_key: bytes, path: str, value: Any) -> str:
+    """OSCrypt-encrypted SHA256 hash of ``(seed || path || canonical_value)``.
+
+    This is the second protection layer Chrome 137+ writes alongside the
+    legacy HMAC. Without it, modifying any value and updating only the HMAC
+    causes Chrome to wipe the entry (because the stored encrypted hash no
+    longer matches the new value — diagnosed empirically against Chrome
+    148 on macOS: ``Profile 2`` lost all 11 freshly-installed extensions on
+    next launch because we updated MACs but not encrypted hashes).
+
+    Algorithm (mechanical translation of
+    ``PrefHashCalculator::CalculateEncryptedHash`` in
+    ``services/preferences/tracked/pref_hash_calculator.cc``, combined
+    with ``OSCryptImpl::EncryptString`` in
+    ``components/os_crypt/sync/os_crypt_mac.mm``)::
+
+        message    = seed || path || value_as_string(value)
+        digest     = SHA256(message)                          # 32 bytes
+        ciphertext = AES-128-CBC( digest, key, IV=" "*16,     # 48 bytes
+                                  PKCS7 padded )
+        blob       = b"v10" || ciphertext                     # 51 bytes
+        result     = base64(blob)                             # 68 chars
+
+    ``aes_key`` is the destination browser's Safe Storage key: the same
+    16-byte ``PBKDF2(keychain_password, "saltysalt", 1003, 16)`` we derive
+    for cookies / Login Data / Web Data re-encryption. Linux and Windows
+    Chromium use slightly different ``OSCrypt::EncryptString`` schemes
+    (AES-GCM with a random nonce, DPAPI on Windows); this implementation
+    is macOS-only. Calling sites already gate on
+    ``sys.platform == "darwin"`` before reaching here.
+    """
+    msg = seed + path.encode("utf-8") + value_as_string(value)
+    digest = hashlib.sha256(msg).digest()
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(digest) + padder.finalize()
+    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(_OSCRYPT_IV))
+    enc = cipher.encryptor()
+    ct = enc.update(padded) + enc.finalize()
+    return base64.b64encode(_OSCRYPT_PREFIX + ct).decode("ascii")
+
+
 def _resign_macs(
     seed: bytes,
     device_id: str,
     parent_keys: list[str],
     macs_subtree: dict[str, Any],
     prefs_subtree: Mapping[str, Any],
+    encrypt_key: bytes | None,
+    in_encrypted_mode: bool = False,
 ) -> None:
-    """Recompute every leaf MAC under ``macs_subtree`` to match ``prefs_subtree``.
+    """Recompute every leaf MAC and encrypted hash under ``macs_subtree``.
 
-    Walks the existing ``protection.macs`` tree as a template — Chromium decides
-    which prefs are tracked atomically vs. split-by-child, and the shape of the
-    MAC tree captures that decision. We only touch leaves we already see; any
-    extension whose MAC entry was missing in Arc stays missing in the target,
-    and any pref that exists in the data but has no MAC entry is left alone.
+    Walks the existing ``protection.macs`` tree as a template — Chromium
+    decides which prefs are tracked atomically vs. split-by-child, and the
+    shape of the MAC tree captures that decision. We only touch leaves we
+    already see; any extension whose MAC entry was missing in Arc stays
+    missing in the target, and any pref that exists in the data but has
+    no MAC entry is left alone.
+
+    Encrypted-hash siblings (``<name>_encrypted_hash``) live at the same
+    level as their legacy-HMAC counterparts. Both compute over the SAME
+    underlying pref value at the SAME pref path (e.g.
+    ``extensions.settings.<id>``) — only the algorithm differs. We detect
+    these by suffix at the entry point, strip the suffix to recover the
+    real pref path, and pass an ``in_encrypted_mode`` flag down through
+    any nested split-MAC dicts so deeper leaves are computed as encrypted
+    hashes too.
+
+    If ``encrypt_key`` is ``None`` we silently skip encrypted-hash entries
+    rather than break a migration that doesn't have Safe Storage access
+    (e.g. dry-run, headless CI). The legacy HMACs still get rewritten,
+    which is enough for older Chrome builds; only Chrome 137+ requires
+    the encrypted hash, and only on macOS.
     """
     for key in sorted(macs_subtree.keys()):
-        # Skip dangling MACs for prefs that no longer exist.
-        if key not in prefs_subtree:
+        is_encrypted_root = (
+            not in_encrypted_mode
+            and isinstance(key, str)
+            and key.endswith(_ENCRYPTED_HASH_SUFFIX)
+        )
+        # Encrypted-hash entries reference their LEGACY sibling for both
+        # the pref path component and the value to hash. Strip the suffix
+        # to recover the legacy name.
+        prefs_key = (
+            key[: -len(_ENCRYPTED_HASH_SUFFIX)] if is_encrypted_root else key
+        )
+        if prefs_key not in prefs_subtree:
             continue
         node = macs_subtree[key]
+        sub_prefs = prefs_subtree[prefs_key]
+        next_encrypted = in_encrypted_mode or is_encrypted_root
+
         if isinstance(node, dict):
             _resign_macs(
                 seed,
                 device_id,
-                parent_keys + [key],
+                parent_keys + [prefs_key],
                 node,
-                prefs_subtree[key] if isinstance(prefs_subtree[key], Mapping) else {},
+                sub_prefs if isinstance(sub_prefs, Mapping) else {},
+                encrypt_key,
+                next_encrypted,
             )
         elif isinstance(node, str):
-            path = ".".join(parent_keys + [key])
-            macs_subtree[key] = calculate(seed, device_id, path, prefs_subtree[key])
-        # Any other type (None, list, int…) is a malformed MAC entry — leave it
-        # alone so Chromium logs a corruption warning rather than silently
-        # accepting our garbage.
+            path = ".".join(parent_keys + [prefs_key])
+            if next_encrypted:
+                if encrypt_key is not None:
+                    macs_subtree[key] = calculate_encrypted(
+                        seed, encrypt_key, path, sub_prefs
+                    )
+                # else: leave the stale encrypted hash in place. Chrome
+                # may still accept the entry on builds where the
+                # encrypted-hash validation hasn't shipped yet.
+            else:
+                macs_subtree[key] = calculate(seed, device_id, path, sub_prefs)
+        # Any other type (None, list, int…) is a malformed MAC entry —
+        # leave it alone so Chromium logs a corruption warning rather
+        # than silently accepting our garbage.
 
 
-def resign_in_place(target_name: str, prefs: dict[str, Any]) -> None:
+def resign_in_place(
+    target_name: str,
+    prefs: dict[str, Any],
+    *,
+    target_aes_key: bytes | None = None,
+) -> None:
     """Rewrite ``prefs['protection']['macs']`` and ``super_mac`` for ``target_name``.
 
     Mutates ``prefs``. No-op if the protection block is missing (some forks /
     older profiles store everything in the unprotected ``Preferences`` instead).
+
+    ``target_aes_key`` is the destination browser's 16-byte Safe Storage key
+    (PBKDF2 output we derive for cookie / Login Data re-encryption). It's
+    required to compute the Chrome 137+ ``_encrypted_hash`` entries; pass
+    ``None`` and the resign covers the legacy HMACs only.
     """
     seed = seed_for(target_name)
     device_id = machine_id()
@@ -309,7 +424,7 @@ def resign_in_place(target_name: str, prefs: dict[str, Any]) -> None:
         return
     macs = protection.get("macs")
     if isinstance(macs, dict):
-        _resign_macs(seed, device_id, [], macs, prefs)
+        _resign_macs(seed, device_id, [], macs, prefs, target_aes_key)
     if "super_mac" in protection and isinstance(macs, dict):
         # super_mac is HMAC over the (now-recomputed) macs dict, with the empty
         # string as the pref path. The macs dict is *not* stripped of empty
@@ -318,10 +433,15 @@ def resign_in_place(target_name: str, prefs: dict[str, Any]) -> None:
         protection["super_mac"] = calculate(seed, device_id, "", macs)
 
 
-def resign_file(target_name: str, path: Path) -> None:
+def resign_file(
+    target_name: str,
+    path: Path,
+    *,
+    target_aes_key: bytes | None = None,
+) -> None:
     """Convenience wrapper: read JSON, resign, write back atomically."""
     data = json.loads(path.read_text(encoding="utf-8"))
-    resign_in_place(target_name, data)
+    resign_in_place(target_name, data, target_aes_key=target_aes_key)
     # Write with the same compact format Chromium itself uses (no whitespace).
     text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
     tmp = path.with_suffix(path.suffix + ".arc-exporter-tmp")
@@ -410,6 +530,7 @@ def _looks_like_extension_id(value: object) -> bool:
 
 __all__ = (
     "calculate",
+    "calculate_encrypted",
     "chrome_json",
     "extension_ids_in_prefs",
     "machine_id",

@@ -30,20 +30,35 @@ _FOOTER = "</DL><p>\n"
 
 
 def render_tree_to_html(spaces: Iterable[SpaceTree], *, include_today_tabs: bool = True) -> str:
-    """Render a sequence of :class:`SpaceTree` to a NETSCAPE bookmarks HTML string."""
+    """Render a sequence of :class:`SpaceTree` to a NETSCAPE bookmarks HTML string.
+
+    Each space becomes a top-level folder containing (in order): a "Favorites"
+    sub-folder mirroring Arc's icon strip, a "Today Tabs" sub-folder for open
+    tabs, and then the pinned tree. Empty spaces are skipped entirely.
+    """
     parts = [_HEADER]
+    seen_favorites: set[str] = set()
     for space in spaces:
-        children = list(space.pinned)
-        if include_today_tabs and space.today_tabs:
-            today_folder = BookmarkNode(
-                title="Today Tabs",
-                kind="folder",
-                children=list(space.today_tabs),
+        space_children: list[BookmarkNode] = []
+        # Favorites first (Arc shows them at the top of the sidebar). De-dupe
+        # across spaces sharing the same profile so the user doesn't see the
+        # same icon strip twice.
+        unique_favs = [f for f in space.favorites if not (f.url and f.url in seen_favorites)]
+        for f in unique_favs:
+            if f.url:
+                seen_favorites.add(f.url)
+        if unique_favs:
+            space_children.append(
+                BookmarkNode(title="Favorites", kind="folder", children=unique_favs)
             )
-            children = [today_folder] + children
-        if not children:
+        if include_today_tabs and space.today_tabs:
+            space_children.append(
+                BookmarkNode(title="Today Tabs", kind="folder", children=list(space.today_tabs))
+            )
+        space_children.extend(space.pinned)
+        if not space_children:
             continue
-        space_folder = BookmarkNode(title=space.name, kind="folder", children=children)
+        space_folder = BookmarkNode(title=space.name, kind="folder", children=space_children)
         parts.append(_render_node(space_folder, level=1))
     parts.append(_FOOTER)
     return "".join(parts)

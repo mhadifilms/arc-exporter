@@ -162,12 +162,16 @@ class Orchestrator:
         if self.options.bookmarks:
             out = prof_dir / f"bookmarks_{ts}.html"
             spaces = sidebar.for_profile(profile.directory_name) or sidebar.spaces
+            # ``total_urls()`` walks the entire pinned + today-tabs + favorites
+            # tree, so the number we report is the count of clickable bookmark
+            # leaves rather than just the immediate children of each space.
+            total = sum(s.total_urls() for s in spaces)
             if self.options.dry_run:
-                pe.counts["bookmarks"] = sum(len(s.pinned) for s in spaces)
+                pe.counts["bookmarks"] = total
             else:
                 write_bookmarks_html(out, spaces)
                 pe.artefacts["bookmarks"] = out
-                pe.counts["bookmarks"] = sum(len(s.pinned) for s in spaces)
+                pe.counts["bookmarks"] = total
 
         if self.options.passwords:
             out = prof_dir / f"passwords_{ts}.csv"

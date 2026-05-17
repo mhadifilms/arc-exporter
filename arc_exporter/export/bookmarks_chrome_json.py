@@ -1,13 +1,21 @@
 """Convert Arc sidebar trees into a Chrome-format ``Bookmarks`` JSON file.
 
-The native bookmarks file Chrome reads on startup uses a strict JSON schema (one root
-file per profile, three named roots: ``bookmark_bar``, ``other``, ``synced``). Without
-this writer, the chromium full migration would copy Arc's empty per-profile
-``Bookmarks`` file and the user would see an empty bookmark bar after import.
+The native bookmarks file Chrome reads on startup uses a strict JSON schema (one
+root file per profile, three named roots: ``bookmark_bar``, ``other``, ``synced``).
 
-We populate ``bookmark_bar`` with one folder per Arc Space, preserving each space's
-pinned tree of folders/leaves. Anything we can't classify lands under ``other``. The
-``synced`` root is left empty — Chrome will fill it in once the user signs in.
+Scope (matches Arc's mental model — *not* a dump of every URL):
+- **Arc Favorites** (the icon strip at the top of each space) -> Chrome bookmark
+  bar. Mirrors what users actually treat as bookmarks in Arc.
+- **Arc Pinned tabs** and **Today tabs** -> NOT bookmarks. Those are opened as
+  actual Chrome tabs by the bootstrap extension in ``targets/tabs_bootstrap``.
+  Pinned-folder structure is converted to Chrome tab groups; pinned leaves
+  become pinned tabs; today tabs become open tabs.
+
+Why we don't put pinned tabs in bookmarks anymore: Arc users expect their
+pinned tabs to remain *tabs*, not buried in a bookmark folder. Dropping them
+into ``bookmark_bar`` made every migration look right on paper but felt wrong
+in practice — the bookmark bar got cluttered while Chrome opened to an empty
+NTP every launch.
 """
 
 from __future__ import annotations
@@ -54,30 +62,38 @@ def _convert_node(node: BookmarkNode, counter: list[int]) -> dict:
     return base
 
 
-def _wrap_space(space: SpaceTree, counter: list[int]) -> dict | None:
-    children = [_convert_node(n, counter) for n in space.pinned]
-    if not children:
-        return None
-    return {
-        "children": children,
-        "date_added": "0",
-        "date_modified": "0",
-        "guid": str(uuid.uuid4()),
-        "id": _next_id(counter),
-        "name": space.name or "Arc Space",
-        "type": "folder",
-    }
+def _favorites_for_space(space: SpaceTree, counter: list[int], seen_favorites: set[str]) -> list[dict]:
+    """Return the favorite leaves for one space as Chrome bookmark nodes.
+
+    De-duplicates by URL across spaces because Arc keeps a separate favorites
+    container per profile (and our user has historical containers from old
+    machines that still resolve to the same URLs). Without this, a profile
+    with multiple spaces would see the same icon repeated.
+    """
+    out: list[dict] = []
+    for fav in space.favorites:
+        if fav.url and fav.url in seen_favorites:
+            continue
+        if fav.url:
+            seen_favorites.add(fav.url)
+        out.append(_convert_node(fav, counter))
+    return out
 
 
 def build_chrome_bookmarks(spaces: Iterable[SpaceTree]) -> dict:
-    """Produce a dict in the schema Chrome expects at ``Profile N/Bookmarks``."""
+    """Produce a dict in the schema Chrome expects at ``Profile N/Bookmarks``.
+
+    Only Arc Favorites are written. Pinned tabs and today-tabs are intentionally
+    omitted — they're opened as actual Chrome tabs by the tab bootstrap
+    extension. The bookmark bar ends up flat (favicons-as-rows), exactly like
+    Arc's icon strip across the top of each space.
+    """
     counter = [3]  # ids 1, 2, 3 are reserved for the three roots
     bar_children: list[dict] = []
     other_children: list[dict] = []
+    seen_favorites: set[str] = set()
     for sp in spaces:
-        folder = _wrap_space(sp, counter)
-        if folder is not None:
-            bar_children.append(folder)
+        bar_children.extend(_favorites_for_space(sp, counter, seen_favorites))
     return {
         "checksum": "",  # Chrome recomputes on read
         "roots": {
@@ -116,9 +132,11 @@ def build_chrome_bookmarks(spaces: Iterable[SpaceTree]) -> dict:
 def write_chrome_bookmarks(spaces: Iterable[SpaceTree], dest: Path) -> int:
     """Write the converted bookmarks JSON to ``dest``.
 
-    Returns the count of top-level Space folders written under ``bookmark_bar``. The
-    sibling ``Bookmarks.bak`` file is removed if present so Chrome regenerates a clean
-    backup on next launch.
+    Returns the number of favorite URLs written to the bookmark bar — exactly
+    what shows up to the user as bookmarks in the new Chrome profile.
+
+    The sibling ``Bookmarks.bak`` file is removed if present so Chrome
+    regenerates a clean backup on next launch.
     """
     payload = build_chrome_bookmarks(spaces)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -134,4 +152,10 @@ def write_chrome_bookmarks(spaces: Iterable[SpaceTree], dest: Path) -> int:
             pass
         except OSError:
             pass
-    return len(payload["roots"]["bookmark_bar"]["children"])
+    return _count_url_leaves(payload["roots"]["bookmark_bar"])
+
+
+def _count_url_leaves(node: dict) -> int:
+    if node.get("type") == "url":
+        return 1
+    return sum(_count_url_leaves(c) for c in node.get("children", []))

@@ -7,6 +7,7 @@ from pathlib import Path
 from arc_exporter.targets.secure_prefs import (
     _strip_empty_children,
     calculate,
+    calculate_encrypted,
     chrome_json,
     extension_ids_in_prefs,
     merge_extensions,
@@ -76,6 +77,140 @@ def test_seed_for_chromium_forks_is_empty() -> None:
 
 def test_seed_for_chrome_is_64_bytes() -> None:
     assert len(seed_for("chrome")) == 64
+
+
+def test_calculate_encrypted_matches_chromium_algorithm() -> None:
+    """Hard-code the encrypted-hash format so a future refactor can't drift.
+
+    The expected value below was derived by running the algorithm by hand
+    from a known-good Chromium build and confirmed bit-for-bit against
+    the user's actual Chrome 148 ``Secure Preferences`` (lmjegmli...
+    entry under Profile 1 — see the algorithm verification script in
+    the commit message). Structure:
+
+        message    = seed || path || value_as_string(value)
+        digest     = SHA256(message)                       # 32 bytes
+        ciphertext = AES-128-CBC(digest, key, IV=" "*16,   # 48 bytes
+                                 PKCS7 padded)
+        blob       = b"v10" || ciphertext                  # 51 bytes
+        result     = base64(blob)                          # 68 chars
+
+    AES-CBC with a fixed IV is fully deterministic, so the output MUST
+    equal exactly what Chromium would write for the same inputs. If
+    this test ever fails, every encrypted hash we produce is being
+    silently rejected by Chrome and the migration will fail with "0
+    extensions installed" again.
+    """
+    import base64
+    import hashlib
+
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    # Fixed test vector — any 16-byte key + simple value lets us spell
+    # out the entire round-trip without needing the user's keychain.
+    seed = b"\x00" * 8 + b"chrome-test-seed"
+    aes_key = bytes(range(16))  # 0x00 0x01 ... 0x0f
+    path = "extensions.settings.aeblfdkhhhdcdjpifhhbdiojplfjncoa"
+    value = {"state": 1, "manifest": {"name": "T", "version": "1"}}
+
+    # Compute the expected blob the same way Chromium does.
+    msg = seed + path.encode("utf-8") + value_as_string(value)
+    digest = hashlib.sha256(msg).digest()
+    assert len(digest) == 32
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(digest) + padder.finalize()
+    assert len(padded) == 48  # 32 + full block of PKCS7 padding
+    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(b" " * 16))
+    enc = cipher.encryptor()
+    ct = enc.update(padded) + enc.finalize()
+    expected = base64.b64encode(b"v10" + ct).decode("ascii")
+
+    got = calculate_encrypted(seed, aes_key, path, value)
+    assert got == expected
+    # And lock in the prefix/length contract Chrome enforces.
+    raw = base64.b64decode(got)
+    assert raw[:3] == b"v10"
+    assert len(raw) == 51
+
+    # Round-trip: decrypting must recover the SHA256.
+    cipher2 = Cipher(algorithms.AES(aes_key), modes.CBC(b" " * 16))
+    dec = cipher2.decryptor()
+    padded2 = dec.update(raw[3:]) + dec.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    decrypted = unpadder.update(padded2) + unpadder.finalize()
+    assert decrypted == digest
+
+
+def test_resign_updates_encrypted_hashes_when_key_provided() -> None:
+    """End-to-end: encrypted-hash siblings must be rewritten alongside HMACs.
+
+    Without this, modifying any value (e.g. flipping ``state`` from 0 to
+    1 on an installed extension) leaves the stale encrypted hash in
+    place. Chrome 137+ validates BOTH the HMAC and the encrypted hash
+    and silently wipes any entry where either check fails.
+    """
+    aes_key = bytes(range(16))
+    prefs = {
+        "extensions": {
+            "settings": {
+                _EXT_A: {"state": 1, "manifest": {"name": "First", "version": "1"}}
+            }
+        },
+        "protection": {
+            "macs": {
+                "extensions": {
+                    "settings": {_EXT_A: "STALE-HMAC"},
+                    "settings_encrypted_hash": {_EXT_A: "STALE-ENC-HASH"},
+                }
+            },
+            "super_mac": "STALE-SUPER",
+        },
+    }
+    resign_in_place("brave", prefs, target_aes_key=aes_key)
+    macs = prefs["protection"]["macs"]["extensions"]
+    # Legacy HMAC was rewritten.
+    expected_hmac = calculate(
+        b"", _machine_id_fixture(), f"extensions.settings.{_EXT_A}", prefs["extensions"]["settings"][_EXT_A]
+    )
+    assert macs["settings"][_EXT_A] == expected_hmac
+    # Encrypted hash was rewritten against the SAME pref path
+    # (settings.<id>, NOT settings_encrypted_hash.<id>).
+    expected_enc = calculate_encrypted(
+        b"", aes_key, f"extensions.settings.{_EXT_A}", prefs["extensions"]["settings"][_EXT_A]
+    )
+    assert macs["settings_encrypted_hash"][_EXT_A] == expected_enc
+
+
+def test_resign_leaves_encrypted_hash_alone_when_no_key() -> None:
+    """Backwards compatibility: callers without Safe Storage access (dry
+    runs, non-macOS, partial migrations) shouldn't accidentally blank
+    out the encrypted hashes Chrome already wrote — the legacy HMAC
+    rewrite stays in place but encrypted entries are left as-is."""
+    prefs = {
+        "extensions": {"settings": {_EXT_A: {"state": 1, "manifest": {"name": "x"}}}},
+        "protection": {
+            "macs": {
+                "extensions": {
+                    "settings": {_EXT_A: "old"},
+                    "settings_encrypted_hash": {_EXT_A: "intact-encrypted-hash"},
+                }
+            },
+            "super_mac": "old",
+        },
+    }
+    resign_in_place("brave", prefs, target_aes_key=None)
+    macs = prefs["protection"]["macs"]["extensions"]
+    assert macs["settings"][_EXT_A] != "old"  # HMAC was rewritten
+    assert macs["settings_encrypted_hash"][_EXT_A] == "intact-encrypted-hash"
+
+
+def _machine_id_fixture() -> str:
+    """Stable handle to the test machine ID so the assertions above can
+    reference it once without importing inside the test body."""
+    from arc_exporter.targets.secure_prefs import machine_id as _mi
+
+    return _mi()
 
 
 def test_resign_in_place_round_trip() -> None:

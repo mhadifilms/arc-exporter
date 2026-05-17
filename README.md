@@ -14,11 +14,24 @@ produces both portable artefacts (NETSCAPE bookmarks HTML, password CSV, Firefox
 `cookies.sqlite`, extensions report, history JSON, …) and direct migrations into the
 browser of your choice. Nothing is sent over the network.
 
-For Chromium-family targets (Chrome, Brave, Edge, Vivaldi, Opera, Dia) the migration
-copies the entire Arc profile tree into a new target profile, re-encrypts saved
-passwords / credit cards / cookies against the destination browser's Safe Storage
-key, and synthesizes a native `Bookmarks` JSON from Arc's `StorableSidebar.json` so
-your pinned tabs appear in the bookmark bar.
+For Chromium-family targets (Chrome, Brave, Edge, Vivaldi, Opera, Dia) the
+migration copies the entire Arc profile tree into a new target profile,
+re-encrypts saved passwords / credit cards / cookies against the destination
+browser's Safe Storage key, and faithfully reproduces Arc's three URL buckets:
+
+- **Favorites** (Arc's icon strip across the top of each space) become Chrome
+  bookmarks in the bookmark bar.
+- **Pinned tabs** become open Chrome tabs at the left of the tab strip.
+  Chrome 142+ removed the only external APIs third-party tools used to pin
+  tabs or create tab groups (`--load-extension` is silently ignored,
+  `Extensions.loadUnpacked` was removed from CDP, and local CRX install is
+  blocked on macOS), so pin / group state isn't reproduced automatically.
+  Right-click any tab → "Pin tab" once and Chrome remembers across launches.
+- **Today tabs** (the unpinned section above pinned) become regular open
+  Chrome tabs after the pinned ones.
+
+`session.restore_on_startup` is set to "Continue where you left off" in the
+migrated profile so those tabs come back every time you launch Chrome.
 
 For Firefox-family targets and Safari/Orion, the tool drops import-ready files into
 `Profile N/imports/` inside the target's user-data directory so you can load them
@@ -85,16 +98,17 @@ arc-exporter rollback rm --to=chrome --all -y
 
 ## What gets migrated
 
-| Kind        | Portable artefact                       | Chromium direct migration                     | Firefox direct migration              |
-|-------------|-----------------------------------------|-----------------------------------------------|---------------------------------------|
-| Bookmarks   | NETSCAPE `bookmarks.html`               | Synthesizes a native `Bookmarks` JSON         | `bookmarks.html` placed in `imports/` |
-| Passwords   | `passwords.csv` (chmod 600)             | Re-encrypted into target `Login Data`         | CSV placed in `imports/`              |
-| Cards       | Reference CSV (last 4 digits only)      | Re-encrypted into target `Web Data`           | —                                     |
-| Cookies     | Firefox `cookies.sqlite` + JSON         | Re-encrypted in-place in target `Cookies`     | `cookies.sqlite` placed in `imports/` |
-| Extensions  | HTML report with Chrome Web Store links | Extensions copied + `Secure Preferences` HMACs resigned for the target browser, so every extension is already installed on first launch | `policies.json` for force-install     |
-| History     | JSON + HTML                             | Copied as-is (plaintext)                      | —                                     |
-| Open tabs   | OneTab / Toby-compatible JSON           | —                                             | —                                     |
-| Easels/Notes| Markdown (best-effort scrape)           | —                                             | —                                     |
+| Kind        | Portable artefact                       | Chromium direct migration                                                                                                            | Firefox direct migration              |
+|-------------|-----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------|
+| Favorites   | (in NETSCAPE `bookmarks.html`)          | Chrome bookmark bar (flat, mirrors Arc's icon strip)                                                                                 | `bookmarks.html` placed in `imports/` |
+| Pinned tabs | (in NETSCAPE `bookmarks.html`)          | Open Chrome tabs (leftmost in tab strip; pinning blocked by Chrome 142+ for external tools, right-click → Pin tab)                   | `bookmarks.html` placed in `imports/` |
+| Today tabs  | OneTab / Toby-compatible JSON           | Open Chrome tabs (`session.restore_on_startup=1` so they come back next launch)                                                      | JSON placed in `imports/`             |
+| Passwords   | `passwords.csv` (chmod 600)             | Re-encrypted into target `Login Data`                                                                                                | CSV placed in `imports/`              |
+| Cards       | Reference CSV (last 4 digits only)      | Re-encrypted into target `Web Data`                                                                                                  | —                                     |
+| Cookies     | Firefox `cookies.sqlite` + JSON         | Re-encrypted in-place in target `Cookies`                                                                                            | `cookies.sqlite` placed in `imports/` |
+| Extensions  | HTML report with Chrome Web Store links | Web Store delivers fresh, Google-signed CRX bundles via External Extensions descriptors; per-extension storage carried over from Arc | `policies.json` for force-install     |
+| History     | JSON + HTML                             | Copied as-is (plaintext)                                                                                                             | —                                     |
+| Easels/Notes| Markdown (best-effort scrape)           | —                                                                                                                                    | —                                     |
 
 ## Security defaults
 
@@ -120,42 +134,62 @@ vulnerability.
 
 ## How extension migration works
 
-Chromium protects every tracked preference (`extensions.settings.<id>`, the
-search engine, the homepage, …) with an HMAC-SHA256 signature and a global
-`super_mac` over the whole signature dict. The HMAC is keyed by:
+Migrating Chromium extensions directly is harder than it looks. Chromium
+runs two independent integrity checks against every installed extension:
 
-- the browser's compiled-in **seed** — the 64-byte `IDR_PREF_HASH_SEED_BIN` blob
-  for Google Chrome, the empty string for every other Chromium fork (Brave,
-  Edge, Opera, Vivaldi, Comet, Dia, Sidekick, Arc Search), and
-- the machine's **device ID** — `IOPlatformUUID` on macOS, the user's SID minus
-  its relative component on Windows, the empty string on Linux.
+- **Preference integrity.** Each entry in `extensions.settings.<id>` is
+  HMAC-SHA256-signed against the browser's vendor seed + machine device ID
+  and stored in `Secure Preferences`. Any tampering trips a reset that
+  garbage-collects the offending entry.
+- **Content verification.** Each extension's on-disk files are hashed and
+  matched against the signed `_metadata/verified_contents.json` shipped by
+  the Web Store. Mismatched hashes flag the extension as
+  `DISABLE_CORRUPTED` (reason 1024) and Chromium aggressively
+  garbage-collects the folder.
 
-The two browsers share the device ID (same machine), so the only thing standing
-between Arc's extension settings and Chrome trusting them is the seed
-difference. `arc-exporter migrate` exploits this directly:
+We can satisfy the first by resigning HMACs for the target's seed (the
+device ID is shared since both browsers run on the same machine). But we
+cannot satisfy the second: Arc patches several extensions (older versions
+pinned, sidebar-aware content scripts), so its on-disk binaries no longer
+match Google's signed hashes and Chrome rejects every one of them.
 
-1. Copy the Arc profile tree into a brand-new `Profile N` directory — including
-   `Extensions/<id>/`, `Extension State`, `Local Extension Settings`, and
-   `Secure Preferences`.
-2. Read the freshly-copied `Secure Preferences`, walk every entry under
-   `protection.macs`, and recompute each HMAC against the **target browser's
-   seed** with the canonical-JSON serialiser Chromium itself uses (HTML-safe
-   escaping, empty-children stripped, `<` → `\u003C`).
-3. Recompute `super_mac` over the freshly-signed MAC dict.
-4. Write the resigned `Secure Preferences` back, and resign the unprotected
-   `Preferences` file too (it carries tracked prefs like `profile.name`).
+`arc-exporter migrate` therefore mixes the two approaches:
 
-On first launch the target browser validates each HMAC against its own seed +
-machine ID, accepts the entries as authentic, finds the matching extension
-folders on disk, and loads them. No Web Store round-trip, no confirmation
-dialogs, no garbage-collection of "orphan" extension folders.
+1. **Profile-tree copy** brings over everything *except* `Extensions/`.
+   Storage directories (`Local Extension Settings`, `Sync Extension
+   Settings`, `Extension State`, `Extension Rules`, …) ride along so the
+   user's per-extension state survives the round trip.
+2. **Strip stale extension registrations** from the copied `Preferences` /
+   `Secure Preferences`. Arc's entries pointed at paths that no longer
+   exist (we didn't copy them); leaving them in place would have Chrome
+   fight ghost registrations forever.
+3. **Resign the cleaned preferences** against the target browser's vendor
+   seed using a Python port of Chromium's `pref_hash_calculator.cc`. This
+   makes the surviving tracked prefs (`profile.name`, default search
+   engine, …) survive the round trip too.
+4. **Trigger a fresh Web Store install** by writing one `<id>.json`
+   descriptor per extension into the target browser's `External
+   Extensions/` directory (pointing at `clients2.google.com/service/update2/
+   crx`), briefly launching the target browser with
+   `--profile-directory=Profile N`, and waiting for each extension's folder
+   to materialise in `Extensions/`.
+5. **Clean up.** Terminate the target browser and remove the `External
+   Extensions/` descriptors so they don't apply to other profiles on the
+   user's next manual launch.
 
-The algorithm and per-vendor seeds are documented in `arc_exporter/targets/
-secure_prefs.py` with citations to Chromium's `pref_hash_calculator.cc` and the
-*HMAC and "Secure Preferences": Revisiting Chromium-based Browsers Security*
-paper (Picazo-Sanchez et al., CANS 2020). The HTML extension report next to
-each migrated profile is kept as a manual-reinstall fallback in case the seed
-ever rotates.
+The downloaded CRX bundles are signed by Google, so content verification
+passes on the next launch and extensions appear in the browser's UI
+ready to use — with their per-extension storage intact. Extensions that
+have been delisted from the Web Store are reported in the migration
+summary; the HTML extension report next to each migrated profile is kept
+as a manual-reinstall fallback for those and for sideloaded / developer
+extensions that never had a Web Store entry.
+
+The HMAC algorithm and per-vendor seeds live in
+`arc_exporter/targets/secure_prefs.py` with citations to Chromium's
+`pref_hash_calculator.cc` and the *HMAC and "Secure Preferences":
+Revisiting Chromium-based Browsers Security* paper (Picazo-Sanchez et al.,
+CANS 2020).
 
 ## Contributing
 

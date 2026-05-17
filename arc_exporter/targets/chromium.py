@@ -47,7 +47,28 @@ _CACHE_SKIP = {
     "Top Sites-journal",
     "Visited Links",
     "Media Cache",
+    # ``Sessions/`` is Chrome's tab/window restoration store. We deliberately
+    # never carry Arc's tab session over: arc-exporter takes the user's
+    # Arc-pinned + today-tabs and opens THOSE as Chrome tabs in phase 2.
+    # If we copy Sessions/, Chrome on its first launch eagerly restores
+    # every URL Arc had open at quit-time (often 50+ tabs of random
+    # browsing), drowning out the curated tab list we wanted to present.
+    # Same reasoning for the root-level ``Current Session`` / ``Current Tabs``
+    # / ``Last Session`` / ``Last Tabs`` files; those are cleaned in
+    # ``_clean_session_artifacts`` after the profile-tree copy.
+    "Sessions",
 }
+
+# Root-level session/restoration files that, like ``Sessions/``, would
+# cause Chrome to restore Arc's old tab state instead of the curated
+# pinned-tab list we want to surface. Cleaned post-copy so we don't have
+# to teach ``safe_copy_tree`` to skip individual files.
+_SESSION_ARTIFACTS = (
+    "Current Session",
+    "Current Tabs",
+    "Last Session",
+    "Last Tabs",
+)
 
 # Site/PWA storage. Skipping these breaks signed-in sessions; off by default in the
 # new code (legacy stripped them unconditionally). User can opt in via --strip-storage.
@@ -59,12 +80,22 @@ _STORAGE_DIRS = {
     "File System",
 }
 
-# Note: Extension state (``Extensions/``, ``Secure Preferences``, ``Extension
-# State``, …) used to be in this skip list because Chromium garbage-collects
-# orphan extension folders when their ``Secure Preferences`` HMACs don't match
-# the target browser's seed. We now resign those HMACs via
-# ``arc_exporter.targets.secure_prefs`` after the copy, so Chrome trusts the
-# Arc-installed extensions and they appear in the new profile straight away.
+# Extension binaries. We never copy Arc's ``Extensions/<id>/<version>/`` folders:
+# Chromium's content-verification subsystem hashes every file in each extension
+# and compares against the signed ``_metadata/verified_contents.json`` shipped
+# by the Web Store. Arc ships patched / older versions for several extensions,
+# so the on-disk hashes diverge from Google's published values and the target
+# browser flags every transferred extension as ``DISABLE_CORRUPTED`` on launch.
+# Instead, ``ChromiumTarget.migrate_extensions`` enumerates the extensions out
+# of Arc's ``Secure Preferences``, writes one ``External Extensions/<id>.json``
+# descriptor per extension pointing at the Web Store update URL, and briefly
+# launches the target browser so it pulls fresh Google-signed CRX bundles
+# straight into ``Extensions/`` — those pass content verification cleanly.
+# The user's per-extension storage (``Local Extension Settings``, ``Extension
+# State``, ``Sync Extension Settings``, ``Extension Rules``, …) still rides
+# along with the profile-tree copy, so settings carry over once the fresh
+# binaries load.
+_EXTENSION_BINARIES = {"Extensions"}
 
 
 @dataclass
@@ -339,7 +370,7 @@ class ChromiumTarget(Target):
         # 1) Copy the Arc profile into the already-allocated target profile dir.
         if target_profile.path.exists():
             shutil.rmtree(target_profile.path)
-        skip: set[str] = set()
+        skip: set[str] = set(_EXTENSION_BINARIES)
         if not request.keep_cache_dirs:
             skip |= _CACHE_SKIP
         if request.strip_storage:
@@ -352,6 +383,7 @@ class ChromiumTarget(Target):
             display_name=target_profile.display_name,
             path=final,
         )
+        _clean_session_artifacts(target_profile.path)
         self._register_profile(target_profile)
         report.profile = target_profile.display_name
         # Cookies/history ride along with the profile tree copy. Bookmarks do *not*:
@@ -375,20 +407,6 @@ class ChromiumTarget(Target):
             report.errors["bookmarks"] = str(e)
         # History is plaintext (URLs, titles, visit counts) so the copy is sufficient.
         report.succeeded["history"] = 1
-        # Extensions: Arc kept its entire ``extensions.settings`` table inside
-        # ``Secure Preferences``. The on-disk ``Extensions/<id>/`` folders rode
-        # along with the profile-tree copy. The remaining step is the integrity
-        # protection: Chromium hashes every tracked pref with HMAC-SHA256 keyed
-        # by the browser's vendor seed and the machine's device ID, then refuses
-        # to honour any entry whose MAC doesn't match. Since Arc and Chrome share
-        # the same device ID but use different seeds, we resign the whole tree
-        # against the target's seed so Chrome trusts the result.
-        try:
-            self.migrate_extensions(src, target_profile, request, report)
-        except Exception as e:
-            report.errors["extensions"] = str(e)
-            log.exception("[%s] extension migration failed: %s", self.name, e)
-
         # Cookies need re-encryption: encrypted_value is v10-prefixed AES-CBC against
         # Arc's Safe Storage key. Without this pass the target browser sees opaque
         # bytes and treats every session cookie as missing — i.e. you're signed out
@@ -455,97 +473,186 @@ class ChromiumTarget(Target):
             )
             report.skipped["passwords"] = "no target Safe Storage key"
             report.skipped["cards"] = "no target Safe Storage key"
+
+        # Extensions + tab restore go LAST: we launch the target browser
+        # twice — once briefly to install Web Store extensions, then again
+        # for the user with their tabs on the command line — and both
+        # launches grab an exclusive lock on Login Data / Web Data /
+        # Cookies. Anything that touches those DBs has to land before this.
+        try:
+            self.migrate_extensions_and_tabs(src, target_profile, request, report)
+        except Exception as e:
+            report.errors["extensions"] = str(e)
+            log.exception("[%s] extension + tab migration failed: %s", self.name, e)
         return report
 
-    def migrate_extensions(
+    def migrate_extensions_and_tabs(
         self,
         source_profile,
         target_profile: TargetProfile,
         request: MigrationRequest,
         report: MigrationReport,
     ) -> None:
-        """Resign Arc's extension registrations so the target browser honours them.
+        """Two-phase Chrome bootstrap: install extensions, then open tabs.
 
-        Chromium maintains an HMAC-SHA256 signature for every "tracked" preference
-        (``extensions.settings.<id>``, the homepage URL, the default search
-        engine, etc.) plus a ``super_mac`` HMAC over the whole MAC dict. The HMAC
-        is keyed by:
+        Why two phases instead of one nicer single-launch:
 
-        * the browser's compiled-in *seed* — the 64-byte ``IDR_PREF_HASH_SEED_BIN``
-          blob for Google Chrome, the empty string for every other Chromium fork;
-        * the machine's *device ID* — IOPlatformUUID on macOS, the SID without
-          its relative component on Windows, the empty string on Linux.
+        - Web Store installs land in ``state=0`` (sideload protection).
+          The fix — flipping ``state=1`` and resigning Secure Preferences —
+          can only be done while Chrome is NOT running, because Chrome
+          rewrites Secure Preferences on shutdown and would overwrite our
+          edit. So we SIGTERM after phase 1, do the resign, then relaunch.
+        - The user asked for Chrome to stay open with their tabs ready, so
+          phase 2 is a detached relaunch with pinned + today-tab URLs as
+          command-line arguments. We don't terminate that process.
 
-        Arc and the target browser share the same device ID (same machine), so
-        the only thing standing between Arc's extension settings and Chrome
-        trusting them is the seed difference. We rewrite every MAC under
-        ``protection.macs`` against the target's seed, then rewrite
-        ``super_mac``.
+        What we CAN'T do, despite the previous attempt:
 
-        The matching ``Extensions/<id>/`` directories, ``Extension State`` and
-        ``Local Extension Settings`` LevelDBs all rode along with the profile-tree
-        copy, so once the prefs validate Chrome finds everything in place. The
-        end result is a profile where every Arc extension is already installed
-        and enabled the moment Chrome opens the picker entry — no Web Store
-        round-trip, no install confirmation dialogs.
+        - Pin tabs / put tabs into groups: Chrome 142+ removed every
+          external escape hatch for ``chrome.tabs.update({pinned:true})``
+          and ``chrome.tabGroups`` — ``--load-extension`` is silently
+          ignored, ``Extensions.loadUnpacked`` was removed from CDP, and
+          local CRX install is blocked on macOS. The only remaining
+          mechanism is publishing our own Web Store extension, which isn't
+          worth it for a one-shot migration tool.
 
-        Records ``succeeded["extensions"] = <count>`` if the resign worked, or
-        falls back to ``skipped["extensions"]`` + the HTML report when the
-        target's preferences file is missing or unreadable.
+        Records ``succeeded["extensions"]`` and ``succeeded["tabs"]``.
         """
-        from arc_exporter.targets.secure_prefs import (
-            extension_ids_in_prefs,
-            resign_in_place,
+        from arc_exporter.targets.external_extensions import (
+            install_extensions_for_profile,
+            launch_chrome_with_tabs,
+            macos_app_binary,
         )
+        from arc_exporter.targets.secure_prefs import resign_in_place
 
+        wanted = _arc_webstore_extension_ids(source_profile.path)
+        urls = _build_tab_urls(source_profile, request)
+        # ``target_aes_key`` is the destination browser's Safe Storage key
+        # (PBKDF2 of the keychain password). We need it to compute the
+        # Chrome 137+ ``_encrypted_hash`` siblings inside Secure Preferences
+        # — without those, Chrome wipes every entry we touched on next
+        # launch even though the legacy HMACs are correct. This was the
+        # post-migration "0 extensions" regression seen on macOS Chrome 148.
+        target_key = request.target_aes_key
+
+        # Strip Arc's stale extension state from the copied Preferences /
+        # Secure Preferences and resign against the target's HMAC seed. We
+        # do this BEFORE phase 1 so Chrome doesn't see ghost extension
+        # paths and refuse to launch.
         secure_prefs_path = target_profile.path / "Secure Preferences"
         prefs_path = target_profile.path / "Preferences"
-
-        if not secure_prefs_path.exists():
-            report.skipped["extensions"] = (
-                "no Secure Preferences in copied profile; see HTML report for the install list"
+        for path in (secure_prefs_path, prefs_path):
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as e:
+                log.warning("[%s] could not read %s: %s", self.name, path.name, e)
+                continue
+            _strip_extension_state(data)
+            resign_in_place(self.name, data, target_aes_key=target_key)
+            path.write_text(
+                json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+                encoding="utf-8",
             )
+        log.info("[%s] pre-launch prefs sanitized + resigned", self.name)
+
+        binary = macos_app_binary(self.process)
+        if binary is None:
+            if wanted:
+                report.skipped["extensions"] = (
+                    f"{self.name} executable not found on this OS; install manually from the HTML report"
+                )
+            if urls:
+                report.skipped["tabs"] = (
+                    f"{self.name} executable not found; cannot restore tabs"
+                )
             return
 
-        try:
-            data = json.loads(secure_prefs_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            report.skipped["extensions"] = f"could not read Secure Preferences: {e}"
+        if not wanted and not urls:
+            report.succeeded["extensions"] = 0
+            report.succeeded["tabs"] = 0
             return
 
-        installed = len(extension_ids_in_prefs(data))
-        resign_in_place(self.name, data)
-        secure_prefs_path.write_text(
-            json.dumps(data, separators=(",", ":"), ensure_ascii=False),
-            encoding="utf-8",
+        # -- Phase 1: install Web Store extensions, briefly. -----------------
+        installed: list[str] = []
+        missed: list[str] = []
+        if wanted:
+            installed, missed = install_extensions_for_profile(
+                extension_ids=wanted,
+                target_profile_path=target_profile.path,
+                browser_binary=binary,
+                external_extensions_dir=self.root_dir / "External Extensions",
+                timeout_s=300.0,
+                profile_display_name=target_profile.display_name,
+            )
+            log.info(
+                "[%s] phase 1: installed %d/%d Web Store extensions",
+                self.name,
+                len(installed),
+                len(wanted),
+            )
+
+        # -- Between phases: auto-enable, set session restore, resign. -------
+        # Chrome marks External-Extensions-installed entries with
+        # ``state=DISABLED_USER_ACTION`` and disable_reasons=[5]. Flip
+        # them to enabled BEFORE phase 2 so the user opens Chrome and sees
+        # working extensions instead of a wall of "Enable" prompts.
+        enabled = _auto_enable_extensions(
+            self.name, target_profile.path, installed, target_aes_key=target_key
         )
         log.info(
-            "[%s] resigned Secure Preferences for %d extension(s)",
+            "[%s] auto-enabled %d/%d freshly-installed extension(s)",
             self.name,
-            installed,
+            enabled,
+            len(installed),
         )
-
-        # ``Preferences`` also carries tracked-pref HMACs (profile.name, search
-        # engine, etc.). We just wrote ``profile.name`` ourselves in
-        # ``_register_profile`` without resigning, which would normally cause
-        # Chromium to ignore it. Resign now so the user-visible profile name
-        # actually sticks.
+        # Force ``session.restore_on_startup = 1`` while Chrome is OFF so
+        # the next user-initiated Chrome launch restores whatever tabs
+        # phase 2 leaves open. Chrome would clobber this if we wrote it
+        # mid-run.
         if prefs_path.exists():
             try:
-                prefs_data = json.loads(prefs_path.read_text(encoding="utf-8"))
-                resign_in_place(self.name, prefs_data)
+                data = json.loads(prefs_path.read_text(encoding="utf-8"))
+                _set_session_restore_continue(data)
+                resign_in_place(self.name, data, target_aes_key=target_key)
                 prefs_path.write_text(
-                    json.dumps(prefs_data, separators=(",", ":"), ensure_ascii=False),
+                    json.dumps(data, separators=(",", ":"), ensure_ascii=False),
                     encoding="utf-8",
                 )
             except (OSError, json.JSONDecodeError) as e:
-                log.warning("[%s] could not resign Preferences: %s", self.name, e)
+                log.warning("[%s] could not set session restore: %s", self.name, e)
 
-        report.succeeded["extensions"] = installed
-        if installed:
+        # -- Phase 2: open Chrome for the user with their tabs. --------------
+        opened = 0
+        if urls:
+            opened = launch_chrome_with_tabs(
+                target_profile_path=target_profile.path,
+                browser_binary=binary,
+                urls=urls,
+                profile_display_name=target_profile.display_name,
+            )
+            log.info(
+                "[%s] phase 2: launched Chrome with %d tab(s), left running",
+                self.name,
+                opened,
+            )
+
+        report.succeeded["extensions"] = len(installed)
+        report.succeeded["tabs"] = opened
+        if missed:
             report.notes["extensions"] = (
-                f"resigned {installed} extension(s); Chrome loads them directly from the copied "
-                "Extensions/ folder — no Web Store round-trip needed"
+                f"{len(missed)} extension(s) didn't auto-install (most likely "
+                f"removed from the Web Store): {', '.join(missed[:3])}"
+                f"{'…' if len(missed) > 3 else ''}. See the HTML report for "
+                "direct links."
+            )
+        if urls:
+            report.notes["tabs"] = (
+                "Tabs are open as ordinary (un-pinned) tabs. Chrome 142+ removed "
+                "the API third-party tools use to pin tabs or create tab groups, "
+                "so pin / group state can't be reproduced automatically — "
+                "right-click any tab → 'Pin tab' if you want them back."
             )
 
     def _reencrypt_cookies(
@@ -680,6 +787,203 @@ class ChromiumTarget(Target):
         )
 
 
+def _arc_webstore_extension_ids(arc_profile_path: Path) -> list[str]:
+    """Pull Web-Store-installable extension IDs out of Arc's ``Secure Preferences``.
+
+    Filters out anything that isn't a normal Web Store extension:
+
+    - Chromium component extensions (``location=4``) ship with the browser
+      itself, so there's nothing for us to install. Arc, the Web Store
+      launcher itself, the in-browser PDF viewer, and Hangouts all fall in
+      this bucket — they show ``from_webstore=false`` and have no
+      ``update_url`` because they're not delivered through the Web Store.
+    - Force-installed enterprise policy extensions (``location=6`` / ``8``)
+      need the matching admin policy to be present on the target machine;
+      without it the target browser would refuse the install anyway.
+    - Unpacked / developer extensions (``location=3``) live only on the
+      user's disk; there's no Web Store entry to redeliver them from.
+
+    The result is the set of extensions that pass both
+    ``from_webstore=true`` AND a Web Store update URL — anything Google
+    actually distributes through ``clients2.google.com``. Everything else
+    is left to the HTML report's manual-reinstall fallback.
+    """
+    sp_path = arc_profile_path / "Secure Preferences"
+    if not sp_path.exists():
+        return []
+    try:
+        data = json.loads(sp_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    settings = (data.get("extensions") or {}).get("settings") or {}
+    out: list[str] = []
+    for ext_id, meta in settings.items():
+        if not (isinstance(ext_id, str) and len(ext_id) == 32 and ext_id.isalpha() and ext_id.islower()):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        location = meta.get("location")
+        if location not in (1, 5):  # INTERNAL or EXTERNAL_PREF_DOWNLOAD = Web Store
+            continue
+        # Chrome's own internal "extensions" (Web Store launcher, PDF viewer,
+        # Hangouts, plus anything Arc bolted on for its own UI) all show
+        # ``from_webstore=false``; without this guard they'd appear in the
+        # "didn't auto-install" warning every single run.
+        if meta.get("from_webstore") is not True:
+            continue
+        manifest = meta.get("manifest") or {}
+        update_url = manifest.get("update_url") if isinstance(manifest, dict) else None
+        if update_url and "clients2.google.com" not in update_url:
+            continue
+        out.append(ext_id)
+    return sorted(set(out))
+
+
+def _auto_enable_extensions(
+    target_name: str,
+    target_profile_path: Path,
+    extension_ids: list[str],
+    *,
+    target_aes_key: bytes | None = None,
+) -> int:
+    """Best-effort pre-launch enable pass.
+
+    Chrome 142+ enforces an unavoidable side-load protection: any extension
+    Chrome installed via the External Extensions descriptor mechanism
+    lives in ``location=6 (EXTERNAL_PREF_DOWNLOAD)`` and gets
+    ``disable_reasons=[8192]`` (``DISABLE_EXTERNAL_EXTENSION``). When
+    Chrome launches it re-applies this state on every read — flipping
+    ``state=1`` here is overwritten before the user sees a window, and
+    promoting to ``location=1`` is demoted back to 6 if the descriptor
+    file still exists (which it must, or Chrome's garbage collector
+    deletes the extension entirely on next launch).
+    See: empirical bisection log dated 2026-05-16 against Chrome 148.0.7778.
+
+    We still write the "intended" state (enabled, ``location=1``, default
+    flags cleared) for two reasons:
+
+    * Older Chromium forks (pre-142, plus Brave/Edge/Opera) honour the
+      ``state=1`` clear because their side-load protection is weaker.
+      Promoting + enabling there gets the extensions in front of the
+      user with zero clicks.
+    * The resigned MACs cover Chrome's tamper detection, so the
+      "EnforcementLevel" trackers don't reset *other* prefs (theme,
+      homepage, search engine) just because we changed an extension
+      entry.
+
+    On Chrome 142+ the practical outcome is: extensions show up disabled,
+    user clicks Enable in the popup that Chrome itself surfaces. The CLI
+    Next Steps panel calls this out so the user isn't surprised.
+
+    Returns the count of extensions whose entries we touched.
+    """
+    if not extension_ids:
+        return 0
+    from arc_exporter.targets.secure_prefs import resign_in_place
+
+    secure_prefs_path = target_profile_path / "Secure Preferences"
+    if not secure_prefs_path.exists():
+        return 0
+    try:
+        data = json.loads(secure_prefs_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    settings = (data.get("extensions") or {}).get("settings") or {}
+    enabled = 0
+    for ext_id in extension_ids:
+        meta = settings.get(ext_id)
+        if not isinstance(meta, dict):
+            continue
+        meta["state"] = 1
+        meta["disable_reasons"] = []
+        meta["location"] = 1
+        meta["was_installed_by_default"] = False
+        meta["was_installed_by_oem"] = False
+        enabled += 1
+    if enabled == 0:
+        return 0
+    resign_in_place(target_name, data, target_aes_key=target_aes_key)
+    secure_prefs_path.write_text(
+        json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return enabled
+
+
+def _strip_extension_state(prefs: dict) -> None:
+    """Remove per-extension settings from a Preferences / Secure Preferences dict.
+
+    Leaves the rest of the tree (search engines, profile metadata, …) intact
+    so the subsequent ``resign_in_place`` pass still has tracked prefs to
+    cover. Also clears the matching ``protection.macs.extensions.settings``
+    leaves so the resigner doesn't produce signatures for non-existent
+    entries that Chromium would later flag as missing.
+    """
+    extensions = prefs.get("extensions")
+    if isinstance(extensions, dict):
+        extensions.pop("settings", None)
+        extensions.pop("install_signature", None)
+        extensions.pop("pending_updates", None)
+    macs_root = (prefs.get("protection") or {}).get("macs") or {}
+    if isinstance(macs_root, dict):
+        ext_macs = macs_root.get("extensions")
+        if isinstance(ext_macs, dict):
+            ext_macs.pop("settings", None)
+            ext_macs.pop("install_signature", None)
+
+
+def _clean_session_artifacts(profile_path: Path) -> None:
+    """Remove the root-level session files we couldn't filter out at copy time.
+
+    ``safe_copy_tree`` skips directories by name (``Sessions/`` is in
+    :data:`_CACHE_SKIP`) but copies every file under the profile root
+    unconditionally. Chrome stores the user's "what should I restore on
+    next launch?" state in four sibling files at the profile root:
+    ``Current Session``, ``Current Tabs``, ``Last Session``, ``Last Tabs``.
+
+    If we leave Arc's copies of those files in place, Chrome's session
+    restore subsystem kicks in on the very first launch — including
+    phase 1's near-silent extension-install launch — and reopens every
+    URL Arc had loaded at quit time. That clobbers the 17-or-so curated
+    pinned/today-tabs we'd otherwise present in phase 2.
+
+    Idempotent: missing files are silently ignored. We don't touch the
+    ``Sessions/`` directory here because the copy step already skipped
+    it; this function is just for the loose root-level remnants.
+    """
+    for name in _SESSION_ARTIFACTS:
+        p = profile_path / name
+        try:
+            if p.is_file():
+                p.unlink()
+            elif p.is_dir():
+                shutil.rmtree(p)
+        except OSError as e:
+            log.debug("could not remove %s: %s", p, e)
+
+
+def _set_session_restore_continue(prefs: dict) -> None:
+    """Set ``session.restore_on_startup = 1`` ("Continue where you left off").
+
+    Chrome's enum (``chrome/browser/prefs/session_startup_pref.h``):
+
+    - ``0``: open last session, but only for incognito (deprecated for normal)
+    - ``1``: continue where you left off (restore previous session) ← we want this
+    - ``4``: open new tab page (Chrome's default for fresh profiles)
+    - ``5``: open a fixed list of URLs
+
+    Setting this is the difference between "tabs come back when I launch
+    Chrome tomorrow" and "Chrome opens a clean NTP and the bootstrap tabs
+    are silently lost". The pref itself isn't HMAC-tracked, but it lives in
+    Preferences alongside other things that are, so we set it BEFORE the
+    resign step so the rest of the file is still self-consistent.
+    """
+    session = prefs.setdefault("session", {})
+    if isinstance(session, dict):
+        session["restore_on_startup"] = 1
+        session.pop("startup_urls", None)
+
+
 def _realm_from_url(url: str) -> str:
     from urllib.parse import urlparse
 
@@ -696,3 +1000,58 @@ def _now_chromium_us() -> int:
     import time as _time
 
     return int((_time.time() + 11644473600) * 1_000_000)
+
+
+def _build_tab_urls(source_profile, request: MigrationRequest) -> list[str]:
+    """Flatten Arc's pinned + today-tab trees into a single ordered URL list.
+
+    Order matters: pinned URLs are prepended so they end up leftmost in
+    Chrome's tab strip — which is where Chrome convention puts pinned tabs
+    even though we can't programmatically set the pinned flag. That at
+    least keeps the visual layout close to what Arc looked like, and makes
+    "right-click → Pin" trivial for the user.
+
+    Returns an empty list if the request doesn't carry a sidebar path or
+    the sidebar parse fails.
+    """
+    if not request.arc_sidebar_path or not request.arc_sidebar_path.exists():
+        return []
+    try:
+        from arc_exporter.parsers.sidebar import load_sidebar
+    except ImportError:
+        return []
+    try:
+        sidebar = load_sidebar(request.arc_sidebar_path)
+    except Exception as e:
+        log.warning("could not parse sidebar for tab URLs: %s", e)
+        return []
+    spaces = sidebar.for_profile(source_profile.directory_name) or []
+    pinned_urls: list[str] = []
+    today_urls: list[str] = []
+    for sp in spaces:
+        for node in sp.pinned:
+            pinned_urls.extend(_walk_bookmark_urls(node))
+        for node in sp.today_tabs:
+            today_urls.extend(_walk_bookmark_urls(node))
+
+    # Dedupe while preserving order; many users have the same site pinned
+    # AND in today-tabs after a long session and we don't want them to see
+    # 4 copies of github.com.
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in pinned_urls + today_urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _walk_bookmark_urls(node) -> list[str]:
+    """Depth-first traversal yielding every leaf URL under a BookmarkNode."""
+    if getattr(node, "kind", None) == "bookmark":
+        url = getattr(node, "url", None)
+        return [url] if url else []
+    urls: list[str] = []
+    for child in getattr(node, "children", None) or []:
+        urls.extend(_walk_bookmark_urls(child))
+    return urls

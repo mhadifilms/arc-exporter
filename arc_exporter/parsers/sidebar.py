@@ -36,6 +36,14 @@ class SpaceTree:
     profile_dir: str
     pinned: list[BookmarkNode] = field(default_factory=list)
     today_tabs: list[BookmarkNode] = field(default_factory=list)
+    favorites: list[BookmarkNode] = field(default_factory=list)
+    """Arc's "Favorites" row (the icon strip at the top of the sidebar). Stored
+    per-profile in ``StorableSidebar.json`` under ``topAppsContainerIDs``. We
+    attach them to every space owned by the profile; renderers should
+    de-duplicate as needed."""
+
+    def total_urls(self) -> int:
+        return _count_urls(self.favorites) + _count_urls(self.pinned) + _count_urls(self.today_tabs)
 
 
 @dataclass
@@ -45,6 +53,19 @@ class SidebarParseResult:
 
     def for_profile(self, profile_dir: str) -> list[SpaceTree]:
         return [s for s in self.spaces if s.profile_dir == profile_dir]
+
+
+def _count_urls(nodes: Iterable[BookmarkNode]) -> int:
+    """Walk ``nodes`` recursively and count every leaf bookmark with a URL."""
+    stack = list(nodes)
+    n = 0
+    while stack:
+        node = stack.pop()
+        if node.kind == "bookmark" and node.url:
+            n += 1
+        else:
+            stack.extend(node.children)
+    return n
 
 
 def load_sidebar(path: Path) -> SidebarParseResult:
@@ -76,6 +97,12 @@ def parse_sidebar(data: dict) -> SidebarParseResult:
 
     pinned_by_space, unpinned_by_space, space_to_profile = _classify_containers(main.get("spaces") or [])
 
+    # Favorites (Arc's "topApps" — the icon row at the top of the sidebar)
+    # are stored as their own root-level itemContainers, one per profile.
+    # We pull them out of the global item index so we can attach them to each
+    # profile's spaces below.
+    favorites_by_profile = _extract_favorites(item_index)
+
     spaces: list[SpaceTree] = []
     for container_id, space_name in pinned_by_space.items():
         pinned = _walk_children(container_id, item_index)
@@ -83,12 +110,14 @@ def parse_sidebar(data: dict) -> SidebarParseResult:
         today_tabs: list[BookmarkNode] = []
         if today_container:
             today_tabs = _walk_children(today_container, item_index, only_tabs=True)
+        profile_dir = space_to_profile.get(space_name, "Default")
         spaces.append(
             SpaceTree(
                 name=space_name,
-                profile_dir=space_to_profile.get(space_name, "Default"),
+                profile_dir=profile_dir,
                 pinned=pinned,
                 today_tabs=today_tabs,
+                favorites=list(favorites_by_profile.get(profile_dir, [])),
             )
         )
     # Preserve sidebar order
@@ -201,6 +230,80 @@ def _find_unpinned_for_space(space_name: str, unpinned: dict[str, str]) -> str |
         if name == space_name:
             return cid
     return None
+
+
+def _extract_favorites(item_index: dict[str, dict]) -> dict[str, list[BookmarkNode]]:
+    """Walk every ``topApps`` container in ``item_index`` and group its tabs by
+    the profile that owns them.
+
+    Each ``topApps`` container is its own root-level item whose
+    ``data.itemContainer.containerType.topApps._0`` payload describes the
+    owning profile in one of two shapes:
+
+    - ``{"default": True}`` — the Arc ``Default`` profile.
+    - ``{"custom": {"_0": {"directoryBasename": "Profile 7", "machineID": …}}}``
+      — a custom profile, keyed by its on-disk directory name.
+
+    A given profile can have multiple ``topApps`` containers (Arc syncs the
+    icon row across machines, so each ``machineID`` ends up with its own
+    container). We merge them per ``directoryBasename`` and de-duplicate by
+    URL so the user doesn't see the same favorite twice.
+    """
+    out: dict[str, list[BookmarkNode]] = {}
+    seen_urls_by_profile: dict[str, set[str]] = {}
+    for item_id, node in item_index.items():
+        data = node.get("data") or {}
+        container = data.get("itemContainer") or {}
+        ctype = container.get("containerType") or {}
+        top_apps = ctype.get("topApps") if isinstance(ctype, dict) else None
+        if not isinstance(top_apps, dict):
+            continue
+        owner = top_apps.get("_0")
+        profile_dir = _profile_dir_from_owner(owner)
+        if not profile_dir:
+            continue
+        children = _walk_children(item_id, item_index, only_tabs=True)
+        if not children:
+            continue
+        seen = seen_urls_by_profile.setdefault(profile_dir, set())
+        favorites = out.setdefault(profile_dir, [])
+        for node_url in _flatten_unique(children, seen):
+            favorites.append(node_url)
+    return out
+
+
+def _profile_dir_from_owner(owner: object) -> str | None:
+    if not isinstance(owner, dict):
+        return None
+    if owner.get("default") is True:
+        return "Default"
+    custom = owner.get("custom")
+    if isinstance(custom, dict):
+        inner = custom.get("_0")
+        if isinstance(inner, dict):
+            d = inner.get("directoryBasename")
+            if isinstance(d, str) and d:
+                return d
+    return None
+
+
+def _flatten_unique(nodes: Iterable[BookmarkNode], seen: set[str]) -> Iterable[BookmarkNode]:
+    """Yield ``BookmarkNode`` instances skipping URLs we've already emitted.
+
+    Folders are descended into; their leaves are emitted directly (we
+    flatten favorites so the user gets a single tidy icon row in the
+    bookmark bar, not a nested mess).
+    """
+    stack: list[BookmarkNode] = list(nodes)
+    while stack:
+        node = stack.pop(0)
+        if node.kind == "bookmark" and node.url:
+            if node.url in seen:
+                continue
+            seen.add(node.url)
+            yield node
+        else:
+            stack[:0] = node.children
 
 
 def _walk_children(root_id: str, items: dict[str, dict], *, only_tabs: bool = False) -> list[BookmarkNode]:
