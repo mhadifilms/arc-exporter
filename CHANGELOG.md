@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-05-16
 
 ### Added
 - Cross-platform Python package `arc_exporter` (macOS, Windows, Linux).
@@ -142,6 +142,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-profile contamination from `External Extensions` descriptors.
 - Loss of signed-in web-app sessions caused by stripping `IndexedDB` / `Local Storage`
   during profile copy (now opt-in via `--strip-storage`).
+- Phase 2's macOS relaunch was running `/usr/bin/open -na "Contents" --args …`
+  because the bundle name walked one too few `Path.parents`; `open` exited 1
+  with "Unable to find application named 'Contents'" but `check=False` hid
+  it, so Chrome never started and the user saw "Chrome stays open"
+  followed by no Chrome. The bundle is now resolved by walking up until
+  a `.app` ancestor is found and the full bundle path is passed to
+  `open`; non-zero exit codes from `open` are logged.
+- Arc's `Sessions/` directory plus the root-level `Current Session` /
+  `Current Tabs` / `Last Session` / `Last Tabs` files were riding along
+  with the profile-tree copy. Chrome's session restore then reopened
+  every URL Arc had loaded at quit time (often 50+ tabs of random
+  browsing) on phase 1's near-silent extension-install launch, drowning
+  out the curated pinned + today-tabs we wanted in phase 2. `Sessions/`
+  is now in the copy skip set and the root-level files are removed
+  post-copy by `_clean_session_artifacts`.
 
 ## [0.1.0] - 2025-09
 
